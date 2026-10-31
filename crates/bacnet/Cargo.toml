@@ -2,6 +2,8 @@
 name = "bask-bacnet"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "BACnet/IP server with a virtual routed network, serving a bask-points database"
 
 [dependencies]

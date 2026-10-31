@@ -2,6 +2,8 @@
 name = "bask-runner"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Runs a BASidekick building: the sim on its own thread plus its BACnet/IP server, and the terminal front end"
 
 [dependencies]

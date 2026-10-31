@@ -214,8 +214,6 @@ cargo run -p bask-sim --example day -- elementary-school summer chiller-trip AHU
 
 That prints a building's day half-hour by half-hour, which helps when tuning a package.
 
-Archivo Black and JetBrains Mono are bundled in `assets/fonts` under the SIL Open Font License.
-
 ## Limits
 
 - It's a teaching and test fixture, not an engineering model. The physics is right in direction and roughly right in size and speed.
@@ -224,3 +222,9 @@ Archivo Black and JetBrains Mono are bundled in `assets/fonts` under the SIL Ope
 - There are no trend logs, schedules or intrinsic alarming (event-state stays normal; alarm points are binary inputs with in-alarm set).
 - The vendor ID is fixed at 999.
 - The macOS app is ad-hoc signed and the Windows exe unsigned, so each OS warns the first time.
+
+## License
+
+The code is licensed under either of [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. Contributions are taken under the same terms.
+
+The BASidekick name, wordmark and icons in `assets/brand` are not covered by those licenses. Archivo Black and JetBrains Mono are bundled in `assets/fonts` under the SIL Open Font License.

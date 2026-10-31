@@ -6,6 +6,8 @@ members = ["crates/points", "crates/bacnet", "crates/engine", "crates/runner", "
 version = "0.1.0"
 edition = "2024"
 authors = ["BASidekick"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rbhans/basidekick-sim-packages"
 
 [workspace.dependencies]
 bask-points = { path = "crates/points" }

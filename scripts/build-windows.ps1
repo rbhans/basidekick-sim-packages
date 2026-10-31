@@ -13,6 +13,6 @@ $stage = "dist\$name"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $stage | Out-Null
 Copy-Item target\release\basidekick-sim.exe "$stage\BASidekick Building Sim.exe"
-Copy-Item target\release\basidekick-sim-cli.exe, README.md $stage
+Copy-Item target\release\basidekick-sim-cli.exe, README.md, LICENSE-MIT, LICENSE-APACHE $stage
 Compress-Archive -Force -Path $stage -DestinationPath "dist\$name.zip"
 Write-Host "built dist\$name.zip"

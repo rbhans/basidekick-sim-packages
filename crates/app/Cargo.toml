@@ -2,6 +2,8 @@
 name = "basidekick-sim"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "BASidekick Building Sim: fake buildings on BACnet/IP with lite physics and scenarios"
 build = "build.rs"
 

@@ -2,6 +2,8 @@
 name = "bask-points"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "The BACnet object database shared by the BASidekick building simulator and its BACnet/IP server"
 
 [dependencies]
