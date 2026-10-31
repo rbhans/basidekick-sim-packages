@@ -1,0 +1,389 @@
+# Elementary School: classrooms on a VAV air handler with a chiller and a
+# boiler, plus rooftop units for the gym and cafeteria.
+
+id = "elementary-school"
+name = "Elementary School"
+tagline = "Chiller + boiler · AHU with 10 VAVs · gym & cafeteria RTUs"
+description = """
+A 22,000 sq ft elementary school. Eight classrooms, the library and the \
+front office sit on a VAV air handler with chilled-water cooling and \
+hot-water reheat from a central chiller and boiler. The gym and the \
+cafeteria have their own rooftop units, and a kitchen hood fan runs with \
+the cafeteria unit. Classroom boxes carry CO2 sensors."""
+icon = "school"
+area_sqft = 22000
+location = "Naperville, IL"
+network = 2002
+site_instance = 2000
+
+[schedule]
+weekday = ["07:30", "16:00"]
+hvac_lead_min = 90
+profile = "school"
+
+[[zone]]
+id = "class-101"
+name = "Classroom 101"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "east"
+
+[[zone]]
+id = "class-102"
+name = "Classroom 102"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "east"
+
+[[zone]]
+id = "class-103"
+name = "Classroom 103"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "east"
+
+[[zone]]
+id = "class-104"
+name = "Classroom 104"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.7
+facing = "south"
+
+[[zone]]
+id = "class-105"
+name = "Classroom 105"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.7
+facing = "south"
+
+[[zone]]
+id = "class-106"
+name = "Classroom 106"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "west"
+
+[[zone]]
+id = "class-107"
+name = "Classroom 107"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "west"
+
+[[zone]]
+id = "class-108"
+name = "Classroom 108"
+area_sqft = 900
+people = 26
+co2_cfm_per_person = 0.0065
+exposure = 0.6
+facing = "west"
+
+[[zone]]
+id = "library"
+name = "Library"
+area_sqft = 1800
+people = 20
+exposure = 0.5
+facing = "south"
+
+[[zone]]
+id = "office"
+name = "Front Office"
+area_sqft = 1200
+people = 8
+exposure = 0.6
+facing = "north"
+door_cfm = 800
+
+[[zone]]
+id = "gym"
+name = "Gymnasium"
+area_sqft = 6000
+height_ft = 24
+people = 50
+lights_w_sqft = 0.9
+plug_w_sqft = 0.1
+exposure = 0.8
+facing = "roof"
+
+[[zone]]
+id = "cafeteria"
+name = "Cafeteria & Kitchen"
+area_sqft = 3800
+height_ft = 14
+people = 40
+plug_w_sqft = 0.5
+exposure = 0.6
+facing = "north"
+process_btuh = 15000
+
+[[equipment]]
+type = "chiller_plant"
+id = "CH-1"
+description = "Air-cooled chiller and chilled water pump"
+tons = 70
+
+[[equipment]]
+type = "boiler_plant"
+id = "B-1"
+description = "Condensing boiler and hot water pump"
+mbh = 900
+
+[[equipment]]
+type = "ahu"
+id = "AHU-1"
+description = "Air handler, classrooms, library and office"
+supply_cfm = 12000
+cooling = "chw"
+heating = "hw"
+chw_plant = "CH-1"
+hw_plant = "B-1"
+min_oa_pct = 40
+
+[[equipment]]
+type = "vav"
+id = "VAV-101"
+ahu = "AHU-1"
+zone = "class-101"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-102"
+ahu = "AHU-1"
+zone = "class-102"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-103"
+ahu = "AHU-1"
+zone = "class-103"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-104"
+ahu = "AHU-1"
+zone = "class-104"
+max_cfm = 1200
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-105"
+ahu = "AHU-1"
+zone = "class-105"
+max_cfm = 1200
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-106"
+ahu = "AHU-1"
+zone = "class-106"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-107"
+ahu = "AHU-1"
+zone = "class-107"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-108"
+ahu = "AHU-1"
+zone = "class-108"
+max_cfm = 1100
+min_cfm = 550
+co2 = true
+
+[[equipment]]
+type = "vav"
+id = "VAV-LIB"
+description = "VAV box, library"
+ahu = "AHU-1"
+zone = "library"
+max_cfm = 2000
+min_cfm = 500
+
+[[equipment]]
+type = "vav"
+id = "VAV-OFC"
+description = "VAV box, front office"
+ahu = "AHU-1"
+zone = "office"
+max_cfm = 1300
+min_cfm = 300
+
+[[equipment]]
+type = "rtu"
+id = "RTU-GYM"
+description = "Rooftop unit, gymnasium"
+zone = "gym"
+supply_cfm = 6000
+cool_tons = 15
+heat_mbh = 300
+min_oa_pct = 20
+
+[[equipment]]
+type = "rtu"
+id = "RTU-CAF"
+description = "Rooftop unit, cafeteria and kitchen"
+zone = "cafeteria"
+supply_cfm = 4000
+cool_tons = 10
+heat_mbh = 200
+min_oa_pct = 30
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-KIT"
+description = "Kitchen hood exhaust fan"
+cfm = 2400
+interlock = "RTU-CAF"
+zone = "cafeteria"
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-1"
+description = "Restroom exhaust fan"
+cfm = 1200
+
+[[equipment]]
+type = "lighting"
+id = "LTG-1"
+description = "Lighting relay panel"
+zones = ["class-101", "class-102", "class-103", "class-104", "class-105", "class-106", "class-107", "class-108", "library", "office", "gym", "cafeteria"]
+
+[[equipment]]
+type = "meter"
+id = "EM-1"
+description = "Main electric meter"
+
+[[scenario]]
+id = "assembly"
+name = "All-school assembly"
+category = "occupancy"
+description = "The whole school files into the gym for an hour. Classrooms empty out; RTU-GYM fights 300 people and CO2 soars."
+duration_min = 60
+ramp_min = 10
+effects = [
+    { kind = "people", factor = 6.0, zones = ["gym"] },
+    { kind = "people", factor = 0.1, zones = ["class-101", "class-102", "class-103", "class-104", "class-105", "class-106", "class-107", "class-108"] },
+]
+
+[[scenario]]
+id = "lunch-rush"
+name = "Lunch rush"
+category = "occupancy"
+description = "Three lunch waves pack the cafeteria for 45 minutes while the kitchen runs hot."
+duration_min = 45
+ramp_min = 5
+effects = [
+    { kind = "people", factor = 4.0, zones = ["cafeteria"] },
+    { kind = "heat_gain", zone = "cafeteria", btuh = 40000 },
+]
+
+[[scenario]]
+id = "pta-night"
+name = "PTA night"
+category = "occupancy"
+description = "An evening event in the library and the gym: the building runs occupied for three hours after hours."
+duration_min = 180
+effects = [
+    { kind = "force_occupied" },
+    { kind = "people", floor = 0.6, zones = ["library", "gym"] },
+]
+
+[[scenario]]
+id = "chiller-trip"
+name = "Chiller trips"
+category = "equipment"
+description = "CH-1 trips on low refrigerant pressure. CHWS climbs, AHU-1's valve goes wide open, supply air and classrooms warm."
+effects = [{ kind = "fail", equip = "CH-1", part = "cooling" }]
+
+[[scenario]]
+id = "boiler-lockout"
+name = "Boiler flame failure"
+category = "equipment"
+description = "B-1 locks out. HWS sags, reheat valves open wide for nothing and perimeter classrooms cool."
+effects = [{ kind = "fail", equip = "B-1", part = "heating" }]
+
+[[scenario]]
+id = "hw-pump"
+name = "Hot water pump fails"
+category = "equipment"
+description = "HWP-C on, HWP-S off. With no flow the boiler can't prove and every reheat coil goes cold."
+effects = [{ kind = "fail", equip = "B-1", part = "fan" }]
+
+[[scenario]]
+id = "ahu1-fan"
+name = "AHU-1 supply fan VFD faults"
+category = "equipment"
+description = "The drive faults. Static falls to zero, every VAV box drives its damper wide open hunting for air, ten zones drift."
+effects = [{ kind = "fail", equip = "AHU-1", part = "fan" }]
+
+[[scenario]]
+id = "ahu1-oa-stuck"
+name = "AHU-1 outside air damper stuck open"
+category = "equipment"
+description = "Damper at 100 % whatever the command. On a cold day mixed air plunges and the freezestat trips the unit."
+effects = [{ kind = "stuck", equip = "AHU-1", actuator = "oa_damper", position = 100 }]
+
+[[scenario]]
+id = "vav103-damper"
+name = "VAV-103 damper stuck at 10 %"
+category = "equipment"
+description = "The actuator dies. Airflow falls well short of setpoint, Classroom 103 overheats while the box asks for more."
+effects = [{ kind = "stuck", equip = "VAV-103", actuator = "damper", position = 10 }]
+
+[[scenario]]
+id = "vav106-drift"
+name = "VAV-106 sensor drifts high"
+category = "equipment"
+description = "Room 106's sensor drifts to read 5 °F high over two hours. The box over-cools a room that's actually cold. No fault flag."
+ramp_min = 120
+effects = [{ kind = "sensor", equip = "VAV-106", point = "ZN-T", mode = "offset", value = 5.0 }]
+
+[[scenario]]
+id = "vav-offline"
+name = "Classroom wing goes offline"
+category = "network"
+description = "A failed MS/TP repeater takes VAV-101 to VAV-104 off the network for 20 minutes."
+duration_min = 20
+effects = [
+    { kind = "offline", equip = "VAV-101" },
+    { kind = "offline", equip = "VAV-102" },
+    { kind = "offline", equip = "VAV-103" },
+    { kind = "offline", equip = "VAV-104" },
+]

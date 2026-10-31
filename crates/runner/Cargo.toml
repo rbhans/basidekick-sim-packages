@@ -1,0 +1,13 @@
+[package]
+name = "bask-runner"
+version.workspace = true
+edition.workspace = true
+description = "Runs a BASidekick building: the sim on its own thread plus its BACnet/IP server, and the terminal front end"
+
+[dependencies]
+bask-points.workspace = true
+bask-bacnet.workspace = true
+bask-sim.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+dirs = "6"

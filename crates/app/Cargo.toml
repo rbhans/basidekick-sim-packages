@@ -1,0 +1,19 @@
+[package]
+name = "basidekick-sim"
+version.workspace = true
+edition.workspace = true
+description = "BASidekick Building Sim: fake buildings on BACnet/IP with lite physics and scenarios"
+build = "build.rs"
+
+[[bin]]
+name = "basidekick-sim"
+path = "src/main.rs"
+
+[dependencies]
+bask-bacnet.workspace = true
+bask-sim.workspace = true
+bask-runner.workspace = true
+gpui-kit = "0.7.3"
+
+[build-dependencies]
+winresource = "0.1"

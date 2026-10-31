@@ -1,0 +1,12 @@
+[package]
+name = "basidekick-sim-cli"
+version.workspace = true
+edition.workspace = true
+description = "BASidekick Building Sim in a terminal: one building on BACnet/IP, no window needed"
+
+[[bin]]
+name = "basidekick-sim-cli"
+path = "src/main.rs"
+
+[dependencies]
+bask-runner.workspace = true

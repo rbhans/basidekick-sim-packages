@@ -1,0 +1,12 @@
+[package]
+name = "bask-sim"
+version.workspace = true
+edition.workspace = true
+description = "Lite building physics, DDC sequences, packages and scenarios for the BASidekick building simulator"
+
+[dependencies]
+bask-points.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+toml.workspace = true
+chrono.workspace = true

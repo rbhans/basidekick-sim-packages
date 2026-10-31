@@ -1,0 +1,163 @@
+# Small Office: a single-story, 5,000 sq ft office on four packaged rooftop
+# units. The quickest building to get your head around.
+
+id = "small-office"
+name = "Small Office"
+tagline = "Single-story office · 4 RTUs · lighting panel · meter"
+description = """
+A 5,000 sq ft single-story office. Each space has its own packaged rooftop \
+unit with two stages of DX cooling, gas heat and an economizer. One lighting \
+panel, one restroom exhaust fan and a main electric meter round it out."""
+icon = "building"
+area_sqft = 5000
+location = "Columbus, OH"
+network = 2001
+site_instance = 1000
+
+[schedule]
+weekday = ["07:30", "18:00"]
+saturday = ["09:00", "12:00"]
+hvac_lead_min = 60
+profile = "office"
+
+[[zone]]
+id = "open-office"
+name = "Open Office"
+area_sqft = 2400
+people = 18
+exposure = 0.7
+facing = "south"
+
+[[zone]]
+id = "private-offices"
+name = "Private Offices"
+area_sqft = 1100
+people = 6
+exposure = 0.8
+facing = "east"
+
+[[zone]]
+id = "conference"
+name = "Conference Room"
+area_sqft = 450
+people = 6
+exposure = 0.6
+facing = "west"
+
+[[zone]]
+id = "lobby"
+name = "Lobby & Break Room"
+area_sqft = 1050
+people = 3
+exposure = 0.5
+facing = "north"
+door_cfm = 900
+process_btuh = 2500
+
+[[equipment]]
+type = "rtu"
+id = "RTU-1"
+description = "Rooftop unit, open office"
+zone = "open-office"
+supply_cfm = 3000
+cool_tons = 7.5
+heat_mbh = 120
+
+[[equipment]]
+type = "rtu"
+id = "RTU-2"
+description = "Rooftop unit, private offices"
+zone = "private-offices"
+supply_cfm = 1400
+cool_tons = 4
+heat_mbh = 80
+
+[[equipment]]
+type = "rtu"
+id = "RTU-3"
+description = "Rooftop unit, conference room"
+zone = "conference"
+supply_cfm = 700
+cool_tons = 2
+cool_stages = 1
+heat_mbh = 40
+heat_stages = 1
+
+[[equipment]]
+type = "rtu"
+id = "RTU-4"
+description = "Rooftop unit, lobby and break room"
+zone = "lobby"
+supply_cfm = 1200
+cool_tons = 3
+heat_mbh = 60
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-1"
+description = "Restroom exhaust fan"
+cfm = 450
+
+[[equipment]]
+type = "lighting"
+id = "LTG-1"
+description = "Lighting relay panel"
+zones = ["open-office", "private-offices", "conference", "lobby"]
+
+[[equipment]]
+type = "meter"
+id = "EM-1"
+description = "Main electric meter"
+
+[[scenario]]
+id = "all-hands"
+name = "All-hands in the conference room"
+category = "occupancy"
+description = "Twenty people cram into a room built for six for 90 minutes. RTU-3 runs flat out, CO2 climbs past 1,500 ppm."
+duration_min = 90
+ramp_min = 10
+effects = [{ kind = "people", factor = 3.5, floor = 0.9, zones = ["conference"] }]
+
+[[scenario]]
+id = "front-door-propped"
+name = "Front door propped open"
+category = "occupancy"
+description = "Someone wedges the front door for a delivery. Outside air pours into the lobby for an hour."
+duration_min = 60
+effects = [{ kind = "door_open", zone = "lobby", cfm = 1200 }]
+
+[[scenario]]
+id = "rtu1-fan-belt"
+name = "RTU-1 fan belt snaps"
+category = "equipment"
+description = "SF-C stays on, SF-S drops, SF-FAIL alarms after 30 s. The open office drifts and CO2 builds with no ventilation."
+effects = [{ kind = "fail", equip = "RTU-1", part = "fan" }]
+
+[[scenario]]
+id = "rtu2-compressor"
+name = "RTU-2 compressor lockout"
+category = "equipment"
+description = "High head pressure lockout on RTU-2. The stages are called, the supply air stays warm, the private offices climb."
+effects = [{ kind = "fail", equip = "RTU-2", part = "cooling" }]
+
+[[scenario]]
+id = "rtu1-damper-stuck"
+name = "RTU-1 economizer stuck open"
+category = "equipment"
+description = "The economizer linkage slips and the outside air damper sits at 100 %. Harmless on a mild day; costly on a hot or cold one."
+effects = [{ kind = "stuck", equip = "RTU-1", actuator = "oa_damper", position = 100 }]
+
+[[scenario]]
+id = "lobby-sensor-fail"
+name = "Lobby space sensor fails"
+category = "equipment"
+description = "RTU-4's zone sensor opens: reads -40 °F with a fault, and RTU-4 heats the lobby as hard as it can."
+effects = [{ kind = "sensor", equip = "RTU-4", point = "ZN-T", mode = "fail" }]
+
+[[scenario]]
+id = "rtu3-offline"
+name = "RTU-3 controller drops offline"
+category = "network"
+description = "RTU-3 stops answering BACnet for 30 minutes. It keeps running on its own logic."
+duration_min = 30
+effects = [{ kind = "offline", equip = "RTU-3" }]

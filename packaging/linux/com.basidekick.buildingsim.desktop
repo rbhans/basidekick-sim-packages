@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=BASidekick Building Sim
+Comment=Fake buildings on BACnet/IP with lite physics and scenarios
+Exec=basidekick-sim
+Icon=com.basidekick.buildingsim
+Terminal=false
+Categories=Development;Engineering;
+StartupWMClass=com.basidekick.buildingsim

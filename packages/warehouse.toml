@@ -1,0 +1,182 @@
+# Warehouse: a distribution floor kept from freezing by gas unit heaters,
+# with a conditioned shipping office and break room.
+
+id = "warehouse"
+name = "Warehouse"
+tagline = "Unit heaters · dock doors · two-shift schedule"
+description = """
+A 40,000 sq ft distribution warehouse, 30 ft clear. Four gas unit heaters \
+keep the floor above 55 °F in winter; two big exhaust fans ventilate it while \
+the shifts run. The shipping office and the break room have their own \
+rooftop units. Dock doors open, and the floor feels it."""
+icon = "warehouse"
+area_sqft = 40000
+location = "Indianapolis, IN"
+network = 2004
+site_instance = 4000
+
+[schedule]
+weekday = ["06:00", "22:00"]
+saturday = ["06:00", "14:00"]
+hvac_lead_min = 30
+profile = "warehouse"
+
+[[zone]]
+id = "floor"
+name = "Warehouse Floor"
+area_sqft = 37000
+height_ft = 30
+people = 30
+lights_w_sqft = 0.45
+plug_w_sqft = 0.1
+exposure = 0.9
+facing = "roof"
+door_cfm = 9000
+start_temp_f = 60
+
+[[zone]]
+id = "office"
+name = "Shipping Office"
+area_sqft = 2200
+people = 10
+exposure = 0.7
+facing = "east"
+door_cfm = 600
+
+[[zone]]
+id = "break"
+name = "Break Room"
+area_sqft = 800
+people = 12
+exposure = 0.4
+facing = "north"
+process_btuh = 3000
+
+[[equipment]]
+type = "unit_heater"
+id = "UH-1"
+description = "Gas unit heater, north bay"
+zone = "floor"
+mbh = 200
+
+[[equipment]]
+type = "unit_heater"
+id = "UH-2"
+description = "Gas unit heater, docks"
+zone = "floor"
+mbh = 200
+
+[[equipment]]
+type = "unit_heater"
+id = "UH-3"
+description = "Gas unit heater, south bay"
+zone = "floor"
+mbh = 200
+
+[[equipment]]
+type = "unit_heater"
+id = "UH-4"
+description = "Gas unit heater, staging"
+zone = "floor"
+mbh = 200
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-1"
+description = "Roof exhaust fan, north"
+cfm = 8000
+zone = "floor"
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-2"
+description = "Roof exhaust fan, south"
+cfm = 8000
+zone = "floor"
+
+[[equipment]]
+type = "rtu"
+id = "RTU-1"
+description = "Rooftop unit, shipping office"
+zone = "office"
+supply_cfm = 2000
+cool_tons = 5
+heat_mbh = 100
+
+[[equipment]]
+type = "rtu"
+id = "RTU-2"
+description = "Rooftop unit, break room"
+zone = "break"
+supply_cfm = 900
+cool_tons = 2.5
+cool_stages = 1
+heat_mbh = 50
+heat_stages = 1
+
+[[equipment]]
+type = "lighting"
+id = "LTG-1"
+description = "High-bay lighting panel"
+zones = ["floor", "office", "break"]
+
+[[equipment]]
+type = "meter"
+id = "EM-1"
+description = "Main electric meter"
+
+[[scenario]]
+id = "dock-doors"
+name = "Dock doors open"
+category = "occupancy"
+description = "Every dock door rolls up for an hour of loading. In winter the floor drops fast and all four unit heaters run."
+duration_min = 60
+effects = [{ kind = "door_open", zone = "floor" }]
+
+[[scenario]]
+id = "forklift-charging"
+name = "Forklift charging"
+category = "occupancy"
+description = "The whole fleet goes on charge for four hours: 60,000 BTU/h of battery heat on the floor."
+duration_min = 240
+ramp_min = 15
+effects = [{ kind = "heat_gain", zone = "floor", btuh = 60000 }]
+
+[[scenario]]
+id = "night-shift"
+name = "Extra night shift"
+category = "occupancy"
+description = "A rush order: a full crew works through the night and everything runs occupied for eight hours."
+duration_min = 480
+effects = [
+    { kind = "force_occupied" },
+    { kind = "people", floor = 0.8 },
+]
+
+[[scenario]]
+id = "uh2-burner"
+name = "UH-2 burner fails"
+category = "equipment"
+description = "UH-2's flame won't prove. The fan runs and blows cold air at the docks; status says all is well."
+effects = [{ kind = "fail", equip = "UH-2", part = "heating" }]
+
+[[scenario]]
+id = "uh3-fan"
+name = "UH-3 fan motor fails"
+category = "equipment"
+description = "UH-3 commanded on with no fan status. UH-FAIL alarms."
+effects = [{ kind = "fail", equip = "UH-3", part = "fan" }]
+
+[[scenario]]
+id = "ef1-fail"
+name = "EF-1 fails"
+category = "equipment"
+description = "EF-1 commanded on, no status; EF-FAIL alarms after 30 s."
+effects = [{ kind = "fail", equip = "EF-1", part = "fan" }]
+
+[[scenario]]
+id = "office-sensor"
+name = "Office sensor fails"
+category = "equipment"
+description = "RTU-1's space sensor opens and reads -40 °F. RTU-1 heats the shipping office without letting up."
+effects = [{ kind = "sensor", equip = "RTU-1", point = "ZN-T", mode = "fail" }]

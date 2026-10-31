@@ -1,0 +1,163 @@
+# Retail Store: a big-box-lite store with a glass storefront, open seven
+# days a week, on four rooftop units.
+
+id = "retail-store"
+name = "Retail Store"
+tagline = "Open 7 days · 4 RTUs · storefront doors · heavy lighting"
+description = """
+A 12,000 sq ft store with a tall sales floor behind a south-facing glass \
+storefront, a stockroom with a receiving door, and a back office. Two \
+rooftop units share the sales floor, one each serves the stockroom and the \
+office. Shoppers build to an after-work peak, and the doors never stay shut \
+for long."""
+icon = "store"
+area_sqft = 12000
+location = "Plano, TX"
+network = 2003
+site_instance = 3000
+
+[schedule]
+weekday = ["09:00", "21:00"]
+saturday = ["09:00", "21:00"]
+sunday = ["10:00", "18:00"]
+hvac_lead_min = 60
+profile = "retail"
+
+[[zone]]
+id = "sales-floor"
+name = "Sales Floor"
+area_sqft = 9000
+height_ft = 16
+people = 110
+lights_w_sqft = 1.3
+plug_w_sqft = 0.4
+exposure = 0.6
+facing = "south"
+door_cfm = 1500
+
+[[zone]]
+id = "stockroom"
+name = "Stockroom"
+area_sqft = 2200
+height_ft = 16
+people = 5
+lights_w_sqft = 0.6
+plug_w_sqft = 0.2
+exposure = 0.5
+facing = "north"
+door_cfm = 3000
+
+[[zone]]
+id = "office"
+name = "Back Office & Break"
+area_sqft = 800
+people = 5
+exposure = 0.3
+facing = "core"
+process_btuh = 2000
+
+[[equipment]]
+type = "rtu"
+id = "RTU-1"
+description = "Rooftop unit, sales floor east"
+zone = "sales-floor"
+supply_cfm = 5000
+cool_tons = 12.5
+heat_mbh = 180
+
+[[equipment]]
+type = "rtu"
+id = "RTU-2"
+description = "Rooftop unit, sales floor west"
+zone = "sales-floor"
+supply_cfm = 5000
+cool_tons = 12.5
+heat_mbh = 180
+
+[[equipment]]
+type = "rtu"
+id = "RTU-3"
+description = "Rooftop unit, stockroom"
+zone = "stockroom"
+supply_cfm = 2000
+cool_tons = 5
+heat_mbh = 100
+min_oa_pct = 10
+
+[[equipment]]
+type = "rtu"
+id = "RTU-4"
+description = "Rooftop unit, back office"
+zone = "office"
+supply_cfm = 800
+cool_tons = 2
+cool_stages = 1
+heating = "electric"
+heat_mbh = 30
+heat_stages = 1
+
+[[equipment]]
+type = "exhaust_fan"
+id = "EF-1"
+description = "Restroom exhaust fan"
+cfm = 400
+
+[[equipment]]
+type = "lighting"
+id = "LTG-1"
+description = "Lighting relay panel"
+zones = ["sales-floor", "stockroom", "office"]
+
+[[equipment]]
+type = "meter"
+id = "EM-1"
+description = "Main electric meter"
+
+[[scenario]]
+id = "black-friday"
+name = "Black Friday"
+category = "occupancy"
+description = "Twice the shoppers and the entry doors barely close for six hours. Both sales-floor units run hard; CO2 and demand climb."
+duration_min = 360
+ramp_min = 30
+effects = [
+    { kind = "people", factor = 2.2, zones = ["sales-floor"] },
+    { kind = "door_open", zone = "sales-floor", cfm = 2500 },
+]
+
+[[scenario]]
+id = "truck-day"
+name = "Truck day"
+category = "occupancy"
+description = "The receiving door stands open for 45 minutes while a trailer is unloaded. The stockroom swings toward outside temperature."
+duration_min = 45
+effects = [{ kind = "door_open", zone = "stockroom" }]
+
+[[scenario]]
+id = "rtu2-compressor"
+name = "RTU-2 compressor lockout"
+category = "equipment"
+description = "RTU-2 locks out. RTU-1 carries the sales floor alone and loses ground on a hot afternoon."
+effects = [{ kind = "fail", equip = "RTU-2", part = "cooling" }]
+
+[[scenario]]
+id = "rtu1-oa-stuck"
+name = "RTU-1 economizer stuck open"
+category = "equipment"
+description = "RTU-1's outside air damper sticks at 100 %. Mixed air follows the weather and the unit works far harder than it should."
+effects = [{ kind = "stuck", equip = "RTU-1", actuator = "oa_damper", position = 100 }]
+
+[[scenario]]
+id = "rtu1-sensor-frozen"
+name = "RTU-1 space sensor freezes"
+category = "equipment"
+description = "RTU-1's zone sensor stops updating. RTU-2 keeps reacting to the real floor; RTU-1 holds its last idea of it."
+effects = [{ kind = "sensor", equip = "RTU-1", point = "ZN-T", mode = "frozen" }]
+
+[[scenario]]
+id = "office-offline"
+name = "RTU-4 drops offline"
+category = "network"
+description = "RTU-4's controller loses its network connection for 30 minutes."
+duration_min = 30
+effects = [{ kind = "offline", equip = "RTU-4" }]
