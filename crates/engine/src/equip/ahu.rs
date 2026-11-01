@@ -2,11 +2,17 @@
 //! discharge air temperature from one split-range loop (heat → economizer →
 //! cooling), night cycling when a zone falls out of its unoccupied band, and
 //! a low-temperature detector that trips the fan on freezing mixed air.
+//!
+//! Both setpoints reset the Guideline 36 way, by trim & respond on requests
+//! from the boxes: duct static creeps down until a box runs out of air, and
+//! the supply air creeps up until a zone runs warm (only in cool weather;
+//! when it's warm out the coil stays at its coldest to keep the air dry).
 
 use super::*;
-use crate::control::{DeadTime, Delay, Pi, Stager, Stroke, lag};
+use crate::control::{DeadTime, Delay, Pi, Stager, Stroke, TrimRespond, lag};
 use crate::package::{AhuDef, Cooling, Heating};
 use crate::scenario::Actuator;
+use crate::world::relative_humidity;
 use crate::zone::Zone;
 
 const MODES: [&str; 5] = ["Off", "Occupied", "Night Heat", "Night Cool", "Safety Trip"];
@@ -20,6 +26,8 @@ pub struct AhuOut {
     pub sat: f64,
     pub static_inwc: f64,
     pub oa_fraction: f64,
+    /// Supply air humidity ratio.
+    pub w: f64,
     /// Night cycle: -1 heating, 1 cooling.
     pub night: i8,
 }
@@ -36,6 +44,7 @@ struct Points {
     ra_t: PointRef,
     oa_t: PointRef,
     ra_co2: PointRef,
+    ra_rh: PointRef,
     sa_flow: PointRef,
     oad: PointRef,
     min_oa: PointRef,
@@ -54,6 +63,15 @@ struct Points {
     sat_loop: PointRef,
     sat_tuning: Tuning,
     dsp_tuning: Tuning,
+    sat_reset: PointRef,
+    sat_min: PointRef,
+    sat_max: PointRef,
+    dsp_reset: PointRef,
+    dsp_min: PointRef,
+    dsp_max: PointRef,
+    clg_req: PointRef,
+    press_req: PointRef,
+    req_ignore: PointRef,
 }
 
 pub struct Ahu {
@@ -71,6 +89,9 @@ pub struct Ahu {
     p: Points,
     static_pi: Pi,
     dat_pi: Pi,
+    /// Trim & respond on the warmest the supply air may get, and on duct static.
+    sat_tr: TrimRespond,
+    dsp_tr: TrimRespond,
     oad: Stroke,
     clg_vlv: Stroke,
     htg_vlv: Stroke,
@@ -88,6 +109,9 @@ pub struct Ahu {
     flow: f64,
     mat: f64,
     rat: f64,
+    /// Humidity ratios: return, mixed.
+    ra_w: f64,
+    ma_w: f64,
     filter_load: f64,
     pub out: AhuOut,
     pub occupied: bool,
@@ -151,6 +175,12 @@ impl Ahu {
                 60.0,
             ),
             ra_co2: b.ai("RA-CO2", "Return air CO2", Units::PartsPerMillion, 450.0),
+            ra_rh: b.ai(
+                "RA-RH",
+                "Return air humidity",
+                Units::PercentRelativeHumidity,
+                45.0,
+            ),
             sa_flow: b.ai("SA-FLOW", "Supply airflow", Units::CubicFeetPerMinute, 0.0),
             oad: b.ao("OAD-O", "Outside air damper command", Units::Percent, 0.0),
             min_oa: b.sp(
@@ -218,6 +248,70 @@ impl Ahu {
             ),
             sat_tuning: b.tuning("SAT", "Supply air temperature", "°F", 6.0, 120.0, 200.0),
             dsp_tuning: b.tuning("DSP", "Duct static pressure", "in. wc", 15.0, 20.0, 500.0),
+            sat_reset: b.bv_cmd(
+                "SAT-RESET",
+                "Supply air temperature reset (trim & respond on zone cooling requests)",
+                ["Disabled", "Enabled"],
+                true,
+            ),
+            sat_min: b.param(
+                "SAT-MIN",
+                "Coldest supply air setpoint (used all the time with the reset off)",
+                Units::DegreesFahrenheit,
+                55.0,
+                48.0,
+                60.0,
+            ),
+            sat_max: b.param(
+                "SAT-MAX",
+                "Warmest the reset may take the supply air (below 60 °F outside)",
+                Units::DegreesFahrenheit,
+                65.0,
+                55.0,
+                70.0,
+            ),
+            dsp_reset: b.bv_cmd(
+                "DSP-RESET",
+                "Duct static pressure reset (trim & respond on box pressure requests)",
+                ["Disabled", "Enabled"],
+                true,
+            ),
+            dsp_min: b.param(
+                "DSP-MIN",
+                "Lowest the static reset may go",
+                Units::InchesOfWater,
+                0.25,
+                0.1,
+                1.0,
+            ),
+            dsp_max: b.param(
+                "DSP-MAX",
+                "Highest the static reset may go (used all the time with the reset off)",
+                Units::InchesOfWater,
+                1.25,
+                0.5,
+                2.5,
+            ),
+            clg_req: b.av(
+                "CLG-REQ",
+                "Cooling requests from the boxes, after each box's importance",
+                Units::NoUnits,
+                0.0,
+            ),
+            press_req: b.av(
+                "PRESS-REQ",
+                "Static pressure requests from the boxes, after each box's importance",
+                Units::NoUnits,
+                0.0,
+            ),
+            req_ignore: b.param(
+                "REQ-IGNORE",
+                "Requests the resets ignore before they respond",
+                Units::NoUnits,
+                2.0,
+                0.0,
+                10.0,
+            ),
         };
         Ahu {
             dev: b.device(),
@@ -234,6 +328,10 @@ impl Ahu {
             p,
             static_pi: Pi::new(15.0, 20.0, 20.0, 100.0),
             dat_pi: Pi::new(6.0, 120.0, -100.0, 100.0),
+            // Guideline 36's defaults: start warm and creep, respond 0.3 °F
+            // a request; start at half an inch and creep, respond 0.06 in.
+            sat_tr: TrimRespond::new(65.0, 55.0, 65.0, 0.2, -0.3, 1.0),
+            dsp_tr: TrimRespond::new(0.5, 0.25, 1.25, -0.05, 0.06, 0.13),
             oad: Stroke::new(90.0),
             clg_vlv: Stroke::new(60.0),
             htg_vlv: Stroke::new(60.0),
@@ -250,9 +348,12 @@ impl Ahu {
             flow: 0.0,
             mat: 65.0,
             rat: 72.0,
+            ra_w: 0.0075,
+            ma_w: 0.0075,
             filter_load: 0.2,
             out: AhuOut {
                 sat: 65.0,
+                w: 0.0075,
                 ..Default::default()
             },
             occupied: false,
@@ -279,22 +380,26 @@ impl Ahu {
         sense(db, m, p.oa_t, oat);
 
         // return air: flow-weighted zones, a degree of plenum heat on top
-        let (mut f, mut ft, mut fc, mut t, mut c) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut f, mut ft, mut fc, mut fw, mut t, mut c, mut w) =
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         for &v in &self.vavs {
             let z = &zones[vavs[v].zone];
             f += vavs[v].flow;
             ft += vavs[v].flow * z.temp;
             fc += vavs[v].flow * z.co2;
+            fw += vavs[v].flow * z.w;
             t += z.temp;
             c += z.co2;
+            w += z.w;
         }
         let n = self.vavs.len().max(1) as f64;
-        let (zone_t, zone_co2) = if f > 50.0 {
-            (ft / f, fc / f)
+        let (zone_t, zone_co2, zone_w) = if f > 50.0 {
+            (ft / f, fc / f, fw / f)
         } else {
-            (t / n, c / n)
+            (t / n, c / n, w / n)
         };
         self.rat = lag(self.rat, zone_t + 1.0, 60.0, dt);
+        self.ra_w = lag(self.ra_w, zone_w, 60.0, dt);
 
         // occupancy, or night cycle when a box calls
         self.occupied = occupied(db.read_u32(p.occ_mode), env.occupied);
@@ -338,6 +443,39 @@ impl Ahu {
             dt,
         );
         alarm(db, p.sf_fail, a);
+
+        // the resets: requests the boxes sent last step, scaled by importance
+        let (clg_req, press_req) = self.vavs.iter().fold((0.0, 0.0), |(c, s), &v| {
+            (c + vavs[v].clg_requests, s + vavs[v].press_requests)
+        });
+        db.set_real(p.clg_req, clg_req);
+        db.set_real(p.press_req, press_req);
+        let ignore = db.read_f64(p.req_ignore);
+        let (sat_min, sat_max) = (db.read_f64(p.sat_min), db.read_f64(p.sat_max));
+        let (dsp_min, dsp_max) = (db.read_f64(p.dsp_min), db.read_f64(p.dsp_max));
+        self.sat_tr.min = sat_min;
+        self.sat_tr.max = sat_max.max(sat_min);
+        self.dsp_tr.min = dsp_min;
+        self.dsp_tr.max = dsp_max.max(dsp_min);
+        self.sat_tr.ignore = ignore;
+        self.dsp_tr.ignore = ignore;
+        let sat_reset = db.read_bool(p.sat_reset);
+        let warmest = self.sat_tr.update(running && sat_reset, clg_req, dt);
+        // warm outside: coldest air, for dehumidifying; cool outside: as warm
+        // as the zones allow; in between, a straight line
+        let warm_out = ((oat - 60.0) / 10.0).clamp(0.0, 1.0);
+        program_real(
+            db,
+            p.sa_t_sp,
+            if sat_reset {
+                warmest + (sat_min - warmest) * warm_out
+            } else {
+                sat_min
+            },
+        );
+        let dsp_reset = db.read_bool(p.dsp_reset);
+        let static_reset = self.dsp_tr.update(running && dsp_reset, press_req, dt);
+        program_real(db, p.dsp_sp, if dsp_reset { static_reset } else { dsp_max });
 
         // fan speed on duct static
         let static_sp = db.read_f64(p.dsp_sp);
@@ -430,6 +568,18 @@ impl Ahu {
             0.85 * self.rat + 0.15 * oat
         };
         self.mat = lag(self.mat, mat_target, if running { 20.0 } else { 600.0 }, dt);
+        let oa_w = env.weather.humidity_ratio();
+        let ma_w_target = if running {
+            oaf * oa_w + (1.0 - oaf) * self.ra_w
+        } else {
+            0.85 * self.ra_w + 0.15 * oa_w
+        };
+        self.ma_w = lag(
+            self.ma_w,
+            ma_w_target,
+            if running { 20.0 } else { 600.0 },
+            dt,
+        );
         if running && self.lt_delay.update(self.mat < 38.0, 60.0, dt) {
             self.lt_tripped_s = Some(0.0);
         }
@@ -438,6 +588,7 @@ impl Ahu {
         // coils
         let cfm = self.flow.max(1.0);
         let mut after_cool = self.mat;
+        let mut after_w = self.ma_w;
         let mut chw_load = 0.0;
         let cool_ok = !m.fail_cool[self.dev];
         let clg_pos = self.clg_vlv.update(clg_cmd, dt);
@@ -451,7 +602,11 @@ impl Ahu {
                 if running && plant.flowing && cool_ok {
                     let eff = 0.85 * clg_actual / 100.0;
                     after_cool = self.mat - eff * (self.mat - (plant.supply_t + 3.0)).max(0.0);
-                    chw_load = 1.08 * self.flow * (self.mat - after_cool) * 1.25;
+                    if after_cool < self.mat - 0.5 {
+                        after_w = wet_coil(self.ma_w, after_cool);
+                    }
+                    chw_load = 1.08 * self.flow * (self.mat - after_cool)
+                        + LATENT_PER_CFM * self.flow * (self.ma_w - after_w);
                 }
                 if let Some(i) = self.chw {
                     bus.chw_demand[i].add(chw_load, if running { clg_actual } else { 0.0 });
@@ -461,9 +616,10 @@ impl Ahu {
                 let stages = self.cool.count() as f64;
                 if running && cool_ok && stages > 0.0 {
                     let capacity = (1.0 - 0.006 * (oat - 95.0)).clamp(0.7, 1.15);
-                    after_cool = (self.mat
-                        - stages / 2.0 * self.tons * 12_000.0 * capacity / (1.08 * cfm))
-                        .max(42.0);
+                    let q = stages / 2.0 * self.tons * 12_000.0 * capacity;
+                    let (t, w) = dx_coil(self.mat, self.ma_w, cfm, q);
+                    after_cool = t.max(42.0);
+                    after_w = w;
                 }
             }
             Cooling::None => {}
@@ -513,6 +669,12 @@ impl Ahu {
             dt,
         );
         let sat_reading = self.sat_delay.update(self.out.sat, dt);
+        self.out.w = lag(
+            self.out.w,
+            if running { after_w } else { self.ma_w },
+            if running { 30.0 } else { 600.0 },
+            dt,
+        );
         self.out.running = running;
         self.out.oa_fraction = if running { oaf } else { 0.0 };
 
@@ -520,6 +682,7 @@ impl Ahu {
         sense(db, m, p.ma_t, self.mat);
         sense(db, m, p.ra_t, self.rat);
         sense(db, m, p.ra_co2, zone_co2);
+        sense(db, m, p.ra_rh, relative_humidity(self.rat, self.ra_w));
         let dsp_reading = self.dsp_delay.update(self.out.static_inwc, dt);
         sense_noisy(db, m, p.dsp, dsp_reading, 0.015, env.now);
         sense_noisy(db, m, p.sa_flow, self.flow, self.flow * 0.015, env.now);

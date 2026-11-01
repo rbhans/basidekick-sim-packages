@@ -8,12 +8,19 @@
 //! supervisory controller and field buses behind it.
 //!
 //! The server runs on its own thread. It locks the shared database only while
-//! it answers one request or checks COV subscriptions, so the simulation
-//! engine is never held up for long, and it reports what clients do through
+//! it answers one request or sends notifications, so the simulation engine is
+//! never held up for long, and it reports what clients do through
 //! [`ServerEvent`]s.
+//!
+//! Besides points, devices serve schedules, trend logs (read with
+//! ReadRange) and notification classes. Event notifications the database
+//! queues go out on the server's tick to each notification class's
+//! recipients, and a BAS can acknowledge them and list what's active with
+//! GetEventInformation.
 //!
 //! [`PointDb::network`]: bask_points::PointDb::network
 
+mod alarm;
 mod apdu;
 mod clock;
 mod cov;
@@ -21,8 +28,10 @@ mod encoding;
 mod interfaces;
 mod npdu;
 mod properties;
+mod schedule;
 mod server;
 mod services;
+mod trend;
 
 pub use interfaces::{NetInterface, interfaces};
 
@@ -73,6 +82,12 @@ pub enum ServerEvent {
         text: String,
     },
     Subscribed {
+        from: SocketAddr,
+        device: String,
+        object: String,
+    },
+    /// An AcknowledgeAlarm that took.
+    Acknowledged {
         from: SocketAddr,
         device: String,
         object: String,

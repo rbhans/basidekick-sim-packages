@@ -161,3 +161,43 @@ category = "network"
 description = "RTU-4's controller loses its network connection for 30 minutes."
 duration_min = 30
 effects = [{ kind = "offline", equip = "RTU-4" }]
+
+# Lessons: the Lessons tab sets each one up and walks through it.
+
+[[lesson]]
+id = "frozen-sensor"
+title = "Spot a frozen sensor"
+level = "Beginner"
+goal = "Catch a sensor that stopped updating. It raises no alarm and no fault, so only the trend shows it."
+setup = { season = "summer", time = "11:00", speed = 10, scenarios = ["rtu1-sensor-frozen"], device = "RTU-1", chart = "Zone temperature" }
+steps = [
+    "Watch `ZN-T` on RTU-1 and RTU-2. They serve the same sales floor.",
+    "Look at the Zone temperature chart for RTU-1 over 15 minutes, then an hour.",
+    "Look at `CLG-DMD` and the stages on both units.",
+]
+expect = "RTU-1's `ZN-T` is a perfectly flat line while RTU-2's wanders with the load. No real reading is that steady. RTU-1 thinks the floor is stuck just over its setpoint, so its cooling demand keeps winding up while RTU-2 backs off: two units fighting over one room, and no alarm to say so."
+
+[[lesson]]
+id = "compressor-lockout"
+title = "Calls for cooling that don't cool"
+level = "Intermediate"
+goal = "Prove a unit isn't cooling, from what it's commanded and what the air does."
+setup = { season = "summer", time = "13:00", speed = 10, scenarios = ["rtu2-compressor"], device = "RTU-2", chart = "Air temperatures" }
+steps = [
+    "Read `CLG1-C` and `CLG2-C` on RTU-2. Is it calling for cooling?",
+    "Compare `SA-T` with `MA-T`. What should a running compressor do to that difference?",
+    "Find the alarm, then look at RTU-1 carrying the sales floor.",
+]
+expect = "Both stages are commanded on, but supply air comes off the coil at mixed air temperature: nothing is happening on the coil. `CMP-ALM` comes in a minute later. RTU-1 runs flat out and the sales floor still loses ground on a hot afternoon."
+
+[[lesson]]
+id = "black-friday"
+title = "Black Friday"
+level = "Beginner"
+goal = "Watch a building under far more load than it was designed for."
+setup = { season = "mild", time = "12:00", speed = 10, scenarios = ["black-friday"], device = "RTU-1", chart = "CO2" }
+steps = [
+    "Watch `ZN-CO2` and `EFF-MIN-OA` on RTU-1 and RTU-2 as the crowd builds.",
+    "Watch the stages and `UNIT-MODE`, and the building's `KW` on EM-1.",
+]
+expect = "CO2 climbs and both units open to their full minimum outside air. With the doors barely closing they cool hard all afternoon, and demand climbs on the meter."

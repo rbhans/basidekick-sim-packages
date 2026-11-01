@@ -1,6 +1,7 @@
 //! Packaged single-zone rooftop unit: constant-volume fan, staged DX
 //! cooling, staged gas or electric heat, and an economizer that cools first
-//! when the outside air is good for it.
+//! when the outside air is good for it. Its minimum outside air follows the
+//! zone's CO2 (demand-controlled ventilation).
 
 use super::*;
 use crate::control::{Delay, Pi, Stager, Stroke, lag};
@@ -21,6 +22,7 @@ const MODES: [&str; 6] = [
 struct Points {
     zn_t: PointRef,
     zn_co2: PointRef,
+    zn_rh: PointRef,
     sa_t: PointRef,
     ra_t: PointRef,
     ma_t: PointRef,
@@ -35,6 +37,10 @@ struct Points {
     unocc_clg: PointRef,
     unocc_htg: PointRef,
     min_oa: PointRef,
+    dcv: PointRef,
+    co2_sp: PointRef,
+    area_min_oa: PointRef,
+    eff_min_oa: PointRef,
     eff_clg: PointRef,
     eff_htg: PointRef,
     clg_dmd: PointRef,
@@ -81,6 +87,9 @@ pub struct Rtu {
     filter_load: f64,
     sat: f64,
     mat: f64,
+    /// Humidity ratios: mixed air, supply air.
+    ma_w: f64,
+    sa_w: f64,
     pub fan_running: bool,
     pub occupied: bool,
     pub mode: u32,
@@ -95,6 +104,12 @@ impl Rtu {
         let p = Points {
             zn_t: b.ai("ZN-T", "Zone temperature", Units::DegreesFahrenheit, 72.0),
             zn_co2: b.ai("ZN-CO2", "Zone CO2", Units::PartsPerMillion, 450.0),
+            zn_rh: b.ai(
+                "ZN-RH",
+                "Zone humidity",
+                Units::PercentRelativeHumidity,
+                45.0,
+            ),
             sa_t: b.ai(
                 "SA-T",
                 "Supply air temperature",
@@ -189,6 +204,34 @@ impl Rtu {
                 0.0,
                 100.0,
             ),
+            dcv: b.bv_cmd(
+                "DCV",
+                "Demand-controlled ventilation: minimum outside air follows CO2",
+                ["Disabled", "Enabled"],
+                true,
+            ),
+            co2_sp: b.sp(
+                "CO2-SP",
+                "CO2 at which the damper is at its full minimum",
+                Units::PartsPerMillion,
+                900.0,
+                600.0,
+                2000.0,
+            ),
+            area_min_oa: b.param(
+                "AREA-MIN-OA",
+                "Minimum outside air for an empty room (CO2 300 ppm below setpoint)",
+                Units::Percent,
+                (def.min_oa_pct * 0.4).round(),
+                0.0,
+                100.0,
+            ),
+            eff_min_oa: b.av(
+                "EFF-MIN-OA",
+                "Minimum outside air in use (lower than MIN-OA while CO2 is low)",
+                Units::Percent,
+                def.min_oa_pct,
+            ),
             eff_clg: b.av(
                 "EFF-CLG-SP",
                 "Effective cooling setpoint",
@@ -266,6 +309,8 @@ impl Rtu {
             filter_load: 0.15,
             sat: 70.0,
             mat: 70.0,
+            ma_w: 0.0075,
+            sa_w: 0.0075,
             fan_running: false,
             occupied: false,
             mode: 1,
@@ -286,6 +331,7 @@ impl Rtu {
         self.zone_reading = Some(zr);
         sense(db, m, p.zn_t, zr);
         sense(db, m, p.zn_co2, zone.co2);
+        sense(db, m, p.zn_rh, zone.rh());
         sense(db, m, p.oa_t, oat);
 
         self.occupied = occupied(db.read_u32(p.occ_mode), env.occupied);
@@ -326,11 +372,18 @@ impl Rtu {
 
         // economizer cools first, compressors pick up the rest
         let rat = zone.temp + 0.8;
-        let min_oa = if self.occupied {
-            db.read_f64(p.min_oa)
-        } else {
+        let design_oa = db.read_f64(p.min_oa);
+        let min_oa = if !self.occupied {
             0.0
+        } else if db.read_bool(p.dcv) {
+            let sp = db.read_f64(p.co2_sp);
+            let need = ((db.read_f64(p.zn_co2) - (sp - 300.0)) / 300.0).clamp(0.0, 1.0);
+            let area = db.read_f64(p.area_min_oa).min(design_oa);
+            area + (design_oa - area) * need
+        } else {
+            design_oa
         };
+        db.set_real(p.eff_min_oa, min_oa);
         let econ = self.economizer && self.fan_running && oat < 65.0 && oat < rat - 1.0;
         let (mut oad, mut mech) = (min_oa, clg);
         if econ && clg > 0.0 {
@@ -414,16 +467,35 @@ impl Rtu {
             if self.fan_running { 30.0 } else { 600.0 },
             dt,
         );
+        let oa_w = env.weather.humidity_ratio();
+        let ma_w_target = if self.fan_running {
+            oaf * oa_w + (1.0 - oaf) * zone.w
+        } else {
+            0.8 * zone.w + 0.2 * oa_w
+        };
+        self.ma_w = lag(
+            self.ma_w,
+            ma_w_target,
+            if self.fan_running { 30.0 } else { 600.0 },
+            dt,
+        );
         let capacity = (1.0 - 0.006 * (oat - 95.0)).clamp(0.7, 1.15);
         let q_cool =
             self.stages_cool as f64 * self.tons * 12_000.0 / self.cool.stages() as f64 * capacity;
         let q_heat =
             self.stages_heat as f64 * self.heat_mbh * 1000.0 * 0.8 / self.heat.stages() as f64;
+        let (after_cool, after_w) = dx_coil(self.mat, self.ma_w, cfm, q_cool);
         let sat_target = if self.fan_running {
-            (self.mat + (q_heat - q_cool) / (1.08 * cfm)).clamp(40.0, 140.0)
+            (after_cool + q_heat / (1.08 * cfm)).clamp(40.0, 140.0)
         } else {
             self.mat
         };
+        self.sa_w = lag(
+            self.sa_w,
+            if self.fan_running { after_w } else { self.ma_w },
+            if self.fan_running { 75.0 } else { 600.0 },
+            dt,
+        );
         self.sat = lag(
             self.sat,
             sat_target,
@@ -435,7 +507,7 @@ impl Rtu {
         sense(db, m, p.ra_t, rat);
 
         let air = &mut bus.air[self.zone];
-        air.supply(cfm, self.sat, oaf);
+        air.supply(cfm, self.sat, self.sa_w, oaf);
         air.setpoints = Some((csp, hsp));
 
         // filter loads over ~4 months of run time; the switch trips at 0.8 in.

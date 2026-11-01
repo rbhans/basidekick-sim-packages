@@ -1,8 +1,11 @@
 //! Local wall-clock time for the device object's local-date and local-time.
 //!
-//! A BAS reads these to check a controller's clock; the simulated devices
-//! simply report the host's.
+//! A BAS reads these to check a controller's clock. The simulated devices
+//! report the simulated building's time once the engine runs it, and the
+//! host's before that; the UTC offset and daylight saving are always the
+//! host's. TimeSynchronization is ignored: the sim owns the clock.
 
+use chrono::{Datelike, NaiveDateTime, Timelike};
 #[cfg(not(windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +42,25 @@ impl LocalTime {
     }
 }
 
+/// The sim's time `sim` if it has one, with the host's offset and DST.
+pub fn device_time(sim: Option<NaiveDateTime>) -> LocalTime {
+    let host = now();
+    let Some(t) = sim else {
+        return host;
+    };
+    LocalTime {
+        year: t.year(),
+        month: t.month() as u8,
+        day: t.day() as u8,
+        weekday: t.weekday().number_from_monday() as u8,
+        hour: t.hour() as u8,
+        minute: t.minute() as u8,
+        second: t.second().min(59) as u8,
+        hundredths: (t.nanosecond() / 10_000_000).min(99) as u8,
+        ..host
+    }
+}
+
 #[cfg(unix)]
 pub fn now() -> LocalTime {
     let since = SystemTime::now()
@@ -68,7 +90,7 @@ pub fn now() -> LocalTime {
 
 #[cfg(windows)]
 pub fn now() -> LocalTime {
-    use chrono::{Datelike, Local, Offset, TimeZone, Timelike};
+    use chrono::{Local, Offset, TimeZone};
     let t = Local::now();
     let east = |month| {
         Local

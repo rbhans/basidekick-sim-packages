@@ -1,5 +1,5 @@
 //! The server thread: one UDP socket, routing between BACnet/IP and the
-//! virtual network, and the COV timer.
+//! virtual network, and the timer that sends COV and event notifications.
 //!
 //! Every packet is handled start to finish under one lock of the database;
 //! replies and events are collected while it's held and sent after it's
@@ -8,12 +8,15 @@
 //! answer with SNET/SADR set, and anything that came through another router
 //! is answered back through it with DNET/DADR.
 
+use crate::alarm::{self, Notifier, Outgoing, Route};
 use crate::apdu::{
     self, ABORT_SEGMENTATION_NOT_SUPPORTED, Apdu, ConfirmedHeader, MAX_APDU, confirmed, unconfirmed,
 };
 use crate::cov::{CovOutcome, CovTable, Notification};
+use crate::encoding::ctx_unsigned;
 use crate::npdu::{self, Frame, GLOBAL_NETWORK, NetAddr, Npdu, Peer};
 use crate::services::{self, Reply};
+use crate::trend;
 use crate::{ServerConfig, ServerEvent, ServerStats, interfaces};
 use bask_points::{PointDb, SharedDb};
 use parking_lot::Mutex;
@@ -94,6 +97,8 @@ pub struct Server {
     /// When and what we broadcast lately, to drop the echoes.
     recent_broadcasts: VecDeque<(Instant, u64)>,
     cov: CovTable,
+    /// Where event notifications go.
+    notifier: Notifier,
     /// Whether each device (by instance) was reachable at the last tick, to
     /// announce the ones that come back.
     reachable: HashMap<u32, bool>,
@@ -169,6 +174,7 @@ impl Server {
             broadcast: SocketAddrV4::new(broadcast_ip, port),
             recent_broadcasts: VecDeque::new(),
             cov: CovTable::default(),
+            notifier: Notifier::default(),
             reachable: HashMap::new(),
             last_error: None,
             startup_warning,
@@ -190,7 +196,7 @@ impl Server {
             if now >= next_tick {
                 // The first tick announces every reachable device.
                 if catch_unwind(AssertUnwindSafe(|| self.tick(now))).is_err() {
-                    self.error("internal error checking COV subscriptions".into());
+                    self.error("internal error sending notifications".into());
                 }
                 next_tick = now + COV_INTERVAL;
             }
@@ -358,7 +364,7 @@ impl Server {
     }
 
     fn unconfirmed(
-        &self,
+        &mut self,
         db: &PointDb,
         dest: Dest,
         service: u8,
@@ -366,6 +372,11 @@ impl Server {
         peer: &Peer,
         p: &mut Pending,
     ) {
+        // An I-Am may be from a device an alarm recipient list names.
+        if service == unconfirmed::I_AM {
+            self.notifier.i_am(db, body, peer);
+            return;
+        }
         // A real router wouldn't pass a local broadcast on to its other
         // network, but some tools only send local Who-Is and then talk to
         // routed devices through the router, so local requests reach every
@@ -402,7 +413,8 @@ impl Server {
                     .filter_map(|i| Some((i, services::i_have(db, i, &who_has)?)))
                     .collect()
             }
-            // Time synchronization, I-Am and the rest need no answer.
+            // Time synchronization (the sim owns the clock) and the rest need
+            // no answer.
             _ => return,
         };
         self.count_request(peer);
@@ -429,6 +441,7 @@ impl Server {
             return;
         }
         let from = SocketAddr::V4(peer.addr);
+        let max_apdu = h.max_apdu.min(MAX_APDU);
         let mut writes = Vec::new();
         let mut initial_notification = None;
         let result = match h.service {
@@ -455,6 +468,22 @@ impl Server {
                     Ok(CovOutcome::Cancelled) => Reply::SimpleAck,
                     Err(e) => Reply::Error(e),
                 }),
+            confirmed::READ_RANGE => trend::read_range(db, dev, body, max_apdu),
+            confirmed::ACKNOWLEDGE_ALARM => alarm::acknowledge(db, dev, body).map(|r| match r {
+                Ok(object) => {
+                    let device = db.devices[dev].name.clone();
+                    p.events.push(ServerEvent::Acknowledged {
+                        from,
+                        device,
+                        object,
+                    });
+                    Reply::SimpleAck
+                }
+                Err(e) => Reply::Error(e),
+            }),
+            confirmed::GET_EVENT_INFORMATION => {
+                alarm::get_event_information(db, dev, body, max_apdu)
+            }
             confirmed::DEVICE_COMMUNICATION_CONTROL | confirmed::REINITIALIZE_DEVICE => {
                 Ok(Reply::SimpleAck)
             }
@@ -463,7 +492,7 @@ impl Server {
         let mut reply_apdu = result
             .unwrap_or_else(|e| Reply::Reject(e.reject_reason()))
             .into_apdu(h.invoke_id, h.service);
-        if reply_apdu.len() > h.max_apdu.min(MAX_APDU) {
+        if reply_apdu.len() > max_apdu {
             reply_apdu = too_big;
         }
         p.out.push(reply(db, dev, peer, &reply_apdu, false));
@@ -482,13 +511,15 @@ impl Server {
             }));
     }
 
-    /// COV checks, and I-Am from devices that just came (back) onto the
-    /// network: all of them on the first tick.
+    /// COV checks, event notifications, Who-Is for alarm recipients not yet
+    /// found, and I-Am from devices that just came (back) onto the network:
+    /// all of them on the first tick.
     fn tick(&mut self, now: Instant) {
         let db = self.db.clone();
         let mut out = Vec::new();
         {
-            let db = db.lock();
+            let mut db = db.lock();
+            let notices = db.take_notices();
             let router_up = router_up(&db);
             let mut reachable = HashMap::with_capacity(db.devices.len());
             // The site controller first, so the router announcement leads.
@@ -529,9 +560,70 @@ impl Server {
                     .into_iter()
                     .map(|n| notification(&db, n)),
             );
+            // Devices that are off the network (or behind a router that is)
+            // miss their notifications, as real ones would.
+            for n in &notices {
+                let up = db.device_index(n.device).is_some_and(|i| {
+                    self.reachable
+                        .get(&db.devices[i].instance)
+                        .copied()
+                        .unwrap_or(false)
+                });
+                if up {
+                    for o in self.notifier.route(&db, n) {
+                        out.push(self.outgoing(&db, o));
+                    }
+                }
+            }
+            if router_up {
+                for device in self.notifier.unbound(&db, now) {
+                    out.push(self.who_is(device));
+                }
+            }
         }
         for o in out {
             self.send(o);
+        }
+    }
+
+    fn outgoing(&self, db: &PointDb, o: Outgoing) -> Out {
+        match o.route {
+            Route::Peer(peer) => reply(db, o.device, &peer, &o.apdu, o.confirmed),
+            Route::LocalBroadcast => broadcast_from(db, o.device, &o.apdu, self.broadcast),
+            Route::Remote(addr) => Out {
+                to: self.broadcast,
+                broadcast: true,
+                npdu: npdu::build_npdu(
+                    &Npdu {
+                        dest: Some(addr),
+                        source: routed_address(db, o.device),
+                        expecting_reply: o.confirmed,
+                        message: None,
+                    },
+                    &o.apdu,
+                ),
+            },
+        }
+    }
+
+    /// A global Who-Is for one device, from the site controller.
+    fn who_is(&self, device: u32) -> Out {
+        let mut range = Vec::new();
+        ctx_unsigned(&mut range, 0, device as u64);
+        ctx_unsigned(&mut range, 1, device as u64);
+        Out {
+            to: self.broadcast,
+            broadcast: true,
+            npdu: npdu::build_npdu(
+                &Npdu {
+                    dest: Some(NetAddr {
+                        net: GLOBAL_NETWORK,
+                        mac: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+                &apdu::unconfirmed_request(unconfirmed::WHO_IS, &range),
+            ),
         }
     }
 

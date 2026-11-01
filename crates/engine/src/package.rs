@@ -3,6 +3,7 @@
 //! that make sense for it. The built-in packages live in `packages/` at the
 //! repository root and are compiled in; more can be dropped in a folder.
 
+use crate::lesson::LessonDef;
 use crate::scenario::ScenarioDef;
 use serde::Deserialize;
 use std::path::Path;
@@ -38,6 +39,8 @@ pub struct Package {
     pub equipment: Vec<EquipDef>,
     #[serde(rename = "scenario", default)]
     pub scenarios: Vec<ScenarioDef>,
+    #[serde(rename = "lesson", default)]
+    pub lessons: Vec<LessonDef>,
 }
 
 fn default_icon() -> String {
@@ -511,6 +514,20 @@ impl Package {
             }
             for z in s.effects.iter().filter_map(|e| e.zone()) {
                 zone(z, &format!("scenario {}", s.id))?;
+            }
+        }
+        let globals = crate::scenario::global_scenarios();
+        for l in &self.lessons {
+            let who = format!("lesson {}", l.id);
+            l.setup.season().map_err(|e| format!("{who}: {e}"))?;
+            l.setup.hour().map_err(|e| format!("{who}: {e}"))?;
+            if let Some(d) = &l.setup.device {
+                equip(d, &who)?;
+            }
+            for id in &l.setup.scenarios {
+                if !self.scenarios.iter().chain(&globals).any(|s| &s.id == id) {
+                    return Err(format!("{who} starts scenario {id:?}, which isn't defined"));
+                }
             }
         }
         Ok(())

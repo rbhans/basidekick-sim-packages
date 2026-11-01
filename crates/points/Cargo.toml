@@ -8,3 +8,4 @@ description = "The BACnet object database shared by the BASidekick building simu
 
 [dependencies]
 parking_lot.workspace = true
+chrono.workspace = true

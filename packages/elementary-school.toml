@@ -387,3 +387,137 @@ effects = [
     { kind = "offline", equip = "VAV-103" },
     { kind = "offline", equip = "VAV-104" },
 ]
+
+[[scenario]]
+id = "rogue-zone"
+name = "Rogue zone"
+category = "equipment"
+description = "One room has a load its box can't keep up with, and it asks the air handler for colder air all day."
+effects = [{ kind = "heat_gain", zone = "class-104", btuh = 30000 }]
+
+# Lessons: the Lessons tab sets each one up and walks through it.
+
+[[lesson]]
+id = "first-look"
+title = "Find your way around"
+level = "Beginner"
+goal = "Find the controllers on the network and read a VAV system that's running normally."
+setup = { season = "mild", time = "10:00", speed = 1, device = "AHU-1", chart = "Supply air" }
+steps = [
+    "Discover devices from your BAS (a Who-Is). The site controller, device 2000, answers on BACnet/IP and routes to network 2002, where every other controller lives.",
+    "Open AHU-1. Read `SA-T` against `SA-T-SP`, and `DSP` against `DSP-SP`. The chart here shows the same thing over time.",
+    "Open VAV-101. Compare `ZN-T` with `EFF-CLG-SP` and `EFF-HTG-SP`, and `AIRFLOW` with `AIRFLOW-SP`.",
+    "Find what each loop drives: `CLG-VLV` on the air handler, `DMPR-O` on the box.",
+]
+expect = "Supply air sits within half a degree of its setpoint and static within a few hundredths of an inch. Every box's airflow tracks its setpoint and every room is between its heating and cooling setpoints. That's what normal looks like, so you can spot what isn't."
+
+[[lesson]]
+id = "sat-tuning"
+title = "Tune the supply air loop"
+level = "Intermediate"
+goal = "See what too much gain does to a loop with dead time, and bring it back."
+setup = { season = "summer", time = "10:00", speed = 1, device = "AHU-1", chart = "Supply air" }
+steps = [
+    "Watch `SA-T` for a few minutes at the default tuning (`SAT-KP` 6, `SAT-TI` 120 s).",
+    "Write `SAT-KP` = 40 and `SAT-TI` = 20. They're settings, so write them without a priority.",
+    "Watch the chart for five minutes. Look at `CLG-VLV` in the strip under it.",
+    "Put them back to 6 and 120 and watch it settle.",
+]
+expect = "With the hot gains the valve slams between closed and open and supply air swings about 10 °F peak to peak, about once a minute. The coil and the sensor are a few seconds behind the valve, so the loop is always reacting to old news. Back at 6 and 120 it settles in a few minutes."
+
+[[lesson]]
+id = "static-reset"
+title = "Duct static and trim & respond"
+level = "Intermediate"
+goal = "Watch Guideline 36's static pressure reset find the lowest static the boxes can live with."
+setup = { season = "mild", time = "11:00", speed = 1, device = "AHU-1", chart = "Duct static" }
+steps = [
+    "Read `DSP-SP` on AHU-1. The reset (`DSP-RESET`) has it well under `DSP-MAX` (1.25 in.). Note `SF-SPD` and `KW`.",
+    "Look at `PRESS-REQ` on a few boxes, and at the box whose `DMPR-O` is most open.",
+    "Write `DSP-RESET` = Disabled at priority 8. Watch static go to 1.25 in., and fan speed and `KW` rise.",
+    "Release `DSP-RESET` and watch static trim back down.",
+]
+expect = "With the reset off the fan works harder (`KW` nearly doubles) for exactly the same airflow: the boxes just close their dampers further. Back on, the reset starts over at 0.5 in. and trims 0.05 in. every two minutes until boxes run short of air and send pressure requests, then nudges back up. It rides wherever the neediest boxes are just getting their air."
+
+[[lesson]]
+id = "rogue-zone"
+title = "Find the rogue zone"
+level = "Advanced"
+goal = "Track down the one box that holds a whole air handler hostage, from its requests."
+setup = { season = "mild", time = "09:30", speed = 1, scenarios = ["rogue-zone"], device = "AHU-1", chart = "Supply air" }
+steps = [
+    "On a cool day the supply air reset should let `SA-T-SP` float up toward `SAT-MAX`. Watch it for ten minutes. Where does it go?",
+    "Read `CLG-REQ` on AHU-1, then `CLG-REQ` on each VAV box. Which box keeps sending 3?",
+    "Look at that box: its `ZN-T`, `CLG-LOOP`, `AIRFLOW` against `MAX-FLOW`. Is it doing all it can?",
+    "Set that box's `REQ-IMPORTANCE` to 0 and watch `SA-T-SP` for half an hour.",
+]
+expect = "Classroom 104 has a load VAV-104 can't meet even at full airflow, so it sends 3 cooling requests all day and pins AHU-1 at its coldest supply air within half an hour. The whole building pays for one room: colder air than anyone else needs, and on a cool morning, reheat at every other box. With its importance at 0 the reset creeps back up, 0.2 °F every two minutes. That's a stopgap: the real fix is the load or the box."
+
+[[lesson]]
+id = "dcv"
+title = "Ventilation on demand"
+level = "Beginner"
+goal = "See a classroom's minimum airflow follow its CO2 as the class arrives."
+setup = { season = "mild", time = "06:45", speed = 10, device = "VAV-101", chart = "Airflow" }
+steps = [
+    "Before school, read `ZN-CO2`, `EFF-MIN-FLOW`, `AREA-MIN-FLOW` and `MIN-FLOW` on VAV-101.",
+    "Write `DCV` = Disabled at priority 8 on VAV-102, so you have one box without it.",
+    "Watch the class arrive (7:30 to 8:15). Watch CO2 climb and `EFF-MIN-FLOW` rise toward `MIN-FLOW`.",
+    "Compare VAV-101 and VAV-102 over the morning: airflow, `RHT-VLV`, `ZN-CO2`.",
+]
+expect = "With DCV, VAV-101 idles at its empty-room minimum (220 cfm) until CO2 starts to climb, then ramps to the full 550 cfm by 900 ppm (`CO2-SP`). VAV-102 holds 550 cfm all morning, including the empty hour before school, and reheats more of it on a cool morning."
+
+[[lesson]]
+id = "humidity"
+title = "Supply air and humidity"
+level = "Intermediate"
+goal = "See why a warmer supply air setpoint saves energy but leaves the building damp in muggy weather."
+setup = { season = "summer", time = "10:00", speed = 10, device = "AHU-1", chart = "Humidity" }
+steps = [
+    "Read `RA-RH` on AHU-1 and `ZN-RH` on a few boxes. Note `CH-KW` on CH-1.",
+    "Write `SA-T-SP` = 63 at priority 8 on AHU-1.",
+    "Watch an hour or two of sim time.",
+    "Release `SA-T-SP`.",
+]
+expect = "The rooms stay at temperature, since the boxes just open up for more of the warmer air, but the coil wrings less water out and humidity climbs several points. That's why the supply air reset holds the coldest air whenever it's warm outside."
+
+[[lesson]]
+id = "chiller-trip"
+title = "Chiller trip"
+level = "Intermediate"
+goal = "Follow a plant failure downstream, from the chiller to the classrooms."
+setup = { season = "summer", time = "13:00", speed = 10, scenarios = ["chiller-trip"], device = "CH-1", chart = "Chilled water" }
+steps = [
+    "Watch `CHWS-T` climb away from `CHWS-SP`. What alarm came in?",
+    "Open AHU-1: what does `CLG-VLV` do, and `SA-T`?",
+    "Open the boxes: airflow, cooling loops and `CLG-REQ`.",
+    "Stop the scenario and watch it recover.",
+]
+expect = "The chiller alarms and the loop warms. AHU-1's valve goes wide open chasing a setpoint it can't reach, supply air climbs, the boxes open up for more of the warmer air, and the classrooms start to drift up."
+
+[[lesson]]
+id = "trend-logs"
+title = "History from the controller"
+level = "Beginner"
+goal = "Pull a trend log out of a controller, the way a BAS imports history."
+setup = { season = "mild", time = "10:00", speed = 10, device = "VAV-101", chart = "Zone temperature" }
+steps = [
+    "VAV-101 keeps a trend log, `TL-ZN-T`, sampling `ZN-T` once a minute for a day. Every controller has a few: look for objects named TL-.",
+    "Read its log buffer from your BAS (ReadRange), or import it as a history in Niagara.",
+    "Compare the records with the Zone temperature chart here.",
+    "Write its Log_Interval to 1000 (it counts hundredths of a second, so that's 10 s) and read it again a few minutes later.",
+]
+expect = "The controller's records match the chart. Their time stamps are the building's clock, not your computer's, so the fast clock shows in the log. A log kept in the controller fills whether or not a BAS is watching; a BAS history only has what the BAS polled."
+
+[[lesson]]
+id = "holiday"
+title = "A holiday that isn't"
+level = "Intermediate"
+goal = "See what the occupancy schedule really controls, when it's wrong. Needs a BAS that can edit a BACnet schedule."
+setup = { season = "mild", time = "05:00", speed = 1, device = "VAV-101", chart = "CO2" }
+steps = [
+    "In your BAS, open the schedule `OCC-SCHEDULE` on the site controller (device 2000). It runs Monday to Friday, 7:30 AM to 4 PM.",
+    "Someone keys a holiday into the wrong day: clear today from the weekly schedule, or add an exception for today that's off from midnight.",
+    "Set the speed to 10× and watch the classrooms as the children arrive at 7:30. The clock bar shows the schedule you set.",
+]
+expect = "The building goes unoccupied at 7:30 and stays that way with 300 people in it: the outside air dampers close and the rooms ride their unoccupied setpoints. Classrooms climb past 80 °F and CO2 runs into the thousands of ppm before night cooling even notices. The schedule is the building's only idea of who's there."

@@ -212,6 +212,80 @@ impl Delay {
     }
 }
 
+/// ASHRAE Guideline 36 trim & respond. The setpoint starts at `initial`
+/// when the fan starts and holds for `delay_s`; after that, every
+/// `period_s` it trims a step toward the energy-saving end, unless more
+/// than `ignore` requests came in, when it responds the other way in
+/// proportion to the extra requests (capped at `respond_max`).
+#[derive(Clone, Debug)]
+pub struct TrimRespond {
+    pub min: f64,
+    pub max: f64,
+    pub ignore: f64,
+    initial: f64,
+    trim: f64,
+    respond: f64,
+    respond_max: f64,
+    delay_s: f64,
+    period_s: f64,
+    pub sp: f64,
+    run_s: f64,
+    since_s: f64,
+}
+
+impl TrimRespond {
+    /// `trim` and `respond` carry their signs: static pressure trims down
+    /// and responds up, supply air temperature the other way round.
+    pub fn new(
+        initial: f64,
+        min: f64,
+        max: f64,
+        trim: f64,
+        respond: f64,
+        respond_max: f64,
+    ) -> Self {
+        TrimRespond {
+            min,
+            max,
+            ignore: 2.0,
+            initial,
+            trim,
+            respond,
+            respond_max: respond_max.abs(),
+            delay_s: 600.0,
+            period_s: 120.0,
+            sp: initial,
+            run_s: 0.0,
+            since_s: 0.0,
+        }
+    }
+
+    pub fn update(&mut self, running: bool, requests: f64, dt: f64) -> f64 {
+        if !running {
+            self.run_s = 0.0;
+            self.since_s = 0.0;
+            self.sp = self.initial.clamp(self.min, self.max);
+            return self.sp;
+        }
+        self.run_s += dt;
+        if self.run_s >= self.delay_s {
+            self.since_s += dt;
+            if self.since_s >= self.period_s {
+                self.since_s -= self.period_s;
+                let extra = requests - self.ignore;
+                let change = if extra > 0.0 {
+                    (extra * self.respond).clamp(-self.respond_max, self.respond_max)
+                } else {
+                    self.trim
+                };
+                self.sp += change;
+            }
+        }
+        self.sp = self.sp.clamp(self.min, self.max);
+        self.sp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +346,28 @@ mod tests {
             s.update(0.0, true, 1.0);
         }
         assert_eq!(s.count(), 0);
+    }
+
+    #[test]
+    fn trim_and_respond() {
+        // duct static: starts at 0.5, trims down, responds up
+        let mut tr = TrimRespond::new(0.5, 0.25, 1.5, -0.05, 0.06, 0.13);
+        for _ in 0..600 {
+            tr.update(true, 10.0, 1.0);
+        }
+        assert_eq!(tr.sp, 0.5, "holds through the start-up delay");
+        for _ in 0..240 {
+            tr.update(true, 0.0, 1.0);
+        }
+        assert!((tr.sp - 0.4).abs() < 1e-9, "two trims: {}", tr.sp);
+        for _ in 0..120 {
+            tr.update(true, 3.0, 1.0);
+        }
+        assert!((tr.sp - 0.46).abs() < 1e-9, "one request over the ignores");
+        for _ in 0..120 {
+            tr.update(true, 20.0, 1.0);
+        }
+        assert!((tr.sp - 0.59).abs() < 1e-9, "a flood is capped");
+        assert_eq!(tr.update(false, 0.0, 1.0), 0.5, "fan off starts over");
     }
 }

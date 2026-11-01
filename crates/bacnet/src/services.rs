@@ -1,6 +1,7 @@
 //! The services a simulated device answers: property reads and writes,
 //! Who-Is and Who-Has. COV subscriptions live in `cov`, since they outlast
-//! the request that makes them.
+//! the request that makes them; ReadRange lives in `trend`, and the alarm
+//! services in `alarm`.
 //!
 //! Handlers take the decoded request body and the device it was addressed
 //! to, and return a [`Reply`]; a body that doesn't decode comes back as a
@@ -10,6 +11,7 @@
 use crate::apdu::{self, BacError, MAX_APDU, unconfirmed};
 use crate::encoding::*;
 use crate::properties::{self, Target, device_id, object_id, prop};
+use crate::{alarm, schedule, trend};
 use bask_points::{BacObject, ObjectType, PointDb, PointValue, WriteError, format_value};
 
 /// A confirmed service's outcome, before it gets an invoke id.
@@ -174,8 +176,8 @@ struct PropertyWrite {
     id: ObjectId,
     property: u32,
     index: Option<u64>,
-    /// None for constructed data.
-    value: Option<Vec<Value>>,
+    /// The encoded value, between its opening and closing tags.
+    raw: Vec<u8>,
     priority: Option<u64>,
 }
 
@@ -190,7 +192,7 @@ pub fn write_property(
         id: r.ctx_object_id(0)?,
         property: r.ctx_enumerated(1)?,
         index: r.opt_ctx_unsigned(2)?,
-        value: r.property_value(3)?,
+        raw: r.bracketed(3)?.to_vec(),
         priority: r.opt_ctx_unsigned(4)?,
     };
     if !r.at_end() {
@@ -224,7 +226,7 @@ pub fn write_property_multiple(
                 id,
                 property: r.ctx_enumerated(0)?,
                 index: r.opt_ctx_unsigned(1)?,
-                value: r.property_value(2)?,
+                raw: r.bracketed(2)?.to_vec(),
                 priority: r.opt_ctx_unsigned(3)?,
             });
         }
@@ -258,6 +260,7 @@ pub fn write_property_multiple(
 }
 
 fn write(db: &mut PointDb, dev: usize, w: &PropertyWrite) -> Result<WriteDone, BacError> {
+    let now = db.time();
     let d = &mut db.devices[dev];
     let target = properties::resolve(d, w.id)?;
     if !properties::has_property(d, target, w.property) {
@@ -266,34 +269,40 @@ fn write(db: &mut PointDb, dev: usize, w: &PropertyWrite) -> Result<WriteDone, B
     if w.index.is_some() && !properties::is_array(w.property) {
         return Err(BacError::NOT_AN_ARRAY);
     }
-    let writable = match target {
-        Target::Device => w.property == prop::DESCRIPTION,
-        Target::Object(_) => matches!(
-            w.property,
-            prop::PRESENT_VALUE
-                | prop::RELINQUISH_DEFAULT
-                | prop::OUT_OF_SERVICE
-                | prop::COV_INCREMENT
-                | prop::DESCRIPTION
-        ),
-    };
-    if !writable || w.index.is_some() {
-        return Err(BacError::WRITE_ACCESS_DENIED);
-    }
-    let value = match w.value.as_deref() {
-        Some([v]) => v,
-        _ => return Err(BacError::INVALID_DATA_TYPE),
-    };
     let device = d.name.clone();
     let (object, text) = match target {
         Target::Device => {
-            d.description = char_string(value)?;
+            if w.property != prop::DESCRIPTION {
+                return Err(BacError::WRITE_ACCESS_DENIED);
+            }
+            d.description = char_string(&single_value(&w.raw)?)?;
             (d.name.clone(), format!("description = {:?}", d.description))
         }
         Target::Object(i) => {
             let o = &mut d.objects[i];
-            let text = write_object(o, w.property, value, w.priority)?;
-            (o.name.clone(), text)
+            let text = match (o.object_type, w.property) {
+                (
+                    _,
+                    prop::PRESENT_VALUE
+                    | prop::RELINQUISH_DEFAULT
+                    | prop::OUT_OF_SERVICE
+                    | prop::COV_INCREMENT
+                    | prop::DESCRIPTION,
+                ) => write_object(o, w.property, &single_value(&w.raw)?, w.priority)?,
+                (ObjectType::Schedule, p) => schedule::write(o, p, w.index, &w.raw)?,
+                (ObjectType::TrendLog, p) => trend::write(o, p, &w.raw, now)?,
+                (ObjectType::NotificationClass, p) => alarm::write_class(o, p, w.index, &w.raw)?,
+                (_, p) if o.reporting.is_some() => alarm::write_reporting(o, p, &w.raw)?,
+                _ => return Err(BacError::WRITE_ACCESS_DENIED),
+            };
+            // A schedule follows its new settings (or its return to
+            // service) at once, even with the sim paused.
+            o.refresh_schedule(now);
+            let object = o.name.clone();
+            if o.object_type == ObjectType::Schedule && schedule::is_configuration(w.property) {
+                d.database_revision = d.database_revision.wrapping_add(1);
+            }
+            (object, text)
         }
     };
     Ok(WriteDone {
@@ -301,6 +310,14 @@ fn write(db: &mut PointDb, dev: usize, w: &PropertyWrite) -> Result<WriteDone, B
         object,
         text,
     })
+}
+
+/// The one application-tagged value a simple property takes.
+pub fn single_value(raw: &[u8]) -> Result<Value, BacError> {
+    match app_values(raw) {
+        Some(mut v) if v.len() == 1 => Ok(v.remove(0)),
+        _ => Err(BacError::INVALID_DATA_TYPE),
+    }
 }
 
 /// Applies a write to one of the writable object properties and describes it.
@@ -363,7 +380,7 @@ fn write_object(
 fn point_value(t: ObjectType, v: &Value) -> Result<PointValue, BacError> {
     let pv = if t.is_analog() {
         number(v).map(PointValue::Real)
-    } else if t.is_binary() {
+    } else if t.is_binary() || t == ObjectType::Schedule {
         match *v {
             Value::Enumerated(e) => Some(PointValue::Multi(e)),
             Value::Boolean(b) => Some(PointValue::Binary(b)),

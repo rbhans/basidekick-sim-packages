@@ -129,7 +129,7 @@ description = "Main electric meter"
 id = "dock-doors"
 name = "Dock doors open"
 category = "occupancy"
-description = "Every dock door rolls up for an hour of loading. In winter the floor drops fast and all four unit heaters run."
+description = "Every dock door rolls up for an hour of loading. In winter all four unit heaters run flat out to hold the floor."
 duration_min = 60
 effects = [{ kind = "door_open", zone = "floor" }]
 
@@ -180,3 +180,33 @@ name = "Office sensor fails"
 category = "equipment"
 description = "RTU-1's space sensor opens and reads -40 °F. RTU-1 heats the shipping office without letting up."
 effects = [{ kind = "sensor", equip = "RTU-1", point = "ZN-T", mode = "fail" }]
+
+# Lessons: the Lessons tab sets each one up and walks through it.
+
+[[lesson]]
+id = "sensor-override"
+title = "Override a failed sensor"
+level = "Intermediate"
+goal = "See what a failed sensor does to its controller, and why a fixed value is not a fix."
+setup = { season = "winter", time = "09:00", speed = 10, scenarios = ["office-sensor"], device = "RTU-1", chart = "Zone temperature" }
+steps = [
+    "Read `ZN-T` on RTU-1. What's its reliability, and what is `HTG-DMD` doing about it?",
+    "Watch the Shipping Office's real temperature on its zone card.",
+    "Take `ZN-T` out of service and write 70 to it (from your BAS, or click it here).",
+    "Watch RTU-1 and the office for half an hour.",
+]
+expect = "An open sensor reads -40 °F with a fault, and RTU-1 heats as hard as it can, so the office overheats. Overridden at 70 °F, the controller believes the room is at setpoint and holds a little heat on forever, and the office keeps warming. A fixed value is open-loop control. Fix the sensor, or command the unit directly until you can."
+
+[[lesson]]
+id = "alarms"
+title = "Alarms from the field"
+level = "Beginner"
+goal = "Receive a controller's BACnet alarm in your BAS and acknowledge it."
+setup = { season = "winter", time = "09:00", speed = 1, scenarios = ["ef1-fail"], device = "EF-1" }
+steps = [
+    "`EF-FAIL` on EF-1 goes into alarm 30 seconds after the fan is commanded on with no status.",
+    "EF-1 reports it with BACnet intrinsic alarming, through its notification class `ALARMS`, broadcast on your network. Look for it in your BAS's alarm console.",
+    "Acknowledge it from your BAS. The event log here says who did.",
+    "Stop the scenario and watch the return to normal come in too.",
+]
+expect = "The alarm arrives as a change-of-state event stamped with the building's time, and stays unacknowledged until you acknowledge it. If nothing arrives, the BAS isn't listening: add its address or device to the `ALARMS` Recipient_List, or turn on alarm handling for the device."

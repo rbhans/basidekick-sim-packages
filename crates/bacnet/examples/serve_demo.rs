@@ -7,12 +7,26 @@
 //! Defaults to 127.0.0.1:47808. The site controller is device 2000; behind it
 //! on network 2001 sit VAV-5 (device 2005, MAC 5) and AHU-1 (device 2006,
 //! MAC 6). Zone temperature drifts so polls and COV subscriptions have
-//! something to watch.
+//! something to watch, and its swings trip ZN-T's high and low limits; the
+//! supply fan "fails" for 30 s of every 2 minutes. Time runs on the host's
+//! clock here, ticked once a second.
+//!
+//! - SITE-CTRL: OCC-SCHED (schedule 1, weekdays 07:00–18:00, Saturday
+//!   08:00–12:00), OA-T-TL (trend log 1, every 10 s).
+//! - VAV-5: ZN-T reports out-of-range (71–73 °F), ZN-T-TL (trend log 1,
+//!   every 5 s), and its notification class 1.
+//! - AHU-1: SF-FAIL reports change-of-state, with its own notification
+//!   class 1.
+//!
+//! The notification classes broadcast on the local network. On loopback
+//! that's the server's own port, so point Recipient_List at your client
+//! (by address, or by device for one that answers Who-Is) to see them.
 
 use bask_bacnet::{BacnetServer, ServerConfig};
 use bask_points::{
     BacDevice, BacObject, ObjectType, PointDb, PointRef, PointValue, SharedDb, Units,
 };
+use chrono::NaiveTime;
 use parking_lot::Mutex;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, mpsc};
@@ -51,12 +65,27 @@ fn main() {
         device: 1,
         object: 0,
     };
+    let fan_fail = PointRef {
+        device: 2,
+        object: 3,
+    };
     std::thread::spawn(move || {
         let start = std::time::Instant::now();
+        let mut shown = Vec::new();
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let t = start.elapsed().as_secs_f64();
-            db.lock().set_real(zone_temp, 72.0 + 1.5 * (t / 20.0).sin());
+            let mut db = db.lock();
+            db.set_real(zone_temp, 72.0 + 1.5 * (t / 20.0).sin());
+            db.set_bool(fan_fail, t % 120.0 >= 90.0);
+            db.tick(chrono::Local::now().naive_local());
+            let states: Vec<_> = [zone_temp, fan_fail]
+                .map(|r| (db.obj(r).name.clone(), db.obj(r).event_state()))
+                .into();
+            if states != shown {
+                println!("event states: {states:?}");
+                shown = states;
+            }
         }
     });
 
@@ -88,6 +117,7 @@ fn demo_db() -> SharedDb {
         o.commandable |= t == ObjectType::MultiStateValue;
         o
     };
+    let hm = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
 
     let mut occ = BacObject::new(
         ObjectType::BinaryValue,
@@ -97,6 +127,21 @@ fn demo_db() -> SharedDb {
     );
     occ.commandable = true;
     occ.states = vec!["Unoccupied".into(), "Occupied".into()];
+    let weekday = vec![(hm(7, 0), true), (hm(18, 0), false)];
+    let mut sched = BacObject::schedule(
+        1,
+        "OCC-SCHED",
+        [
+            weekday.clone(),
+            weekday.clone(),
+            weekday.clone(),
+            weekday.clone(),
+            weekday,
+            vec![(hm(8, 0), true), (hm(12, 0), false)],
+            vec![],
+        ],
+    );
+    sched.description = "Building occupancy".into();
     let site = device(
         2000,
         "SITE-CTRL",
@@ -110,6 +155,8 @@ fn demo_db() -> SharedDb {
                 Units::DegreesFahrenheit,
             ),
             occ,
+            sched,
+            BacObject::trend_log(1, "OA-T-TL", (ObjectType::AnalogInput, 1), 10, 1000),
         ],
     );
 
@@ -121,6 +168,7 @@ fn demo_db() -> SharedDb {
         Units::DegreesFahrenheit,
     );
     zn_t.cov_increment = 0.2;
+    zn_t.enable_out_of_range(71.0, 73.0, 0.2, 1, 5);
     let mut zn_sp = analog(
         ObjectType::AnalogValue,
         1,
@@ -150,9 +198,19 @@ fn demo_db() -> SharedDb {
                 "OCC-MODE",
                 &["Auto", "Occupied", "Unoccupied"],
             ),
+            BacObject::trend_log(1, "ZN-T-TL", (ObjectType::AnalogInput, 1), 5, 2000),
+            BacObject::notification_class(1, "ALARMS"),
         ],
     );
 
+    let mut sf_fail = BacObject::new(
+        ObjectType::BinaryInput,
+        2,
+        "SF-FAIL",
+        PointValue::Binary(false),
+    );
+    sf_fail.states = vec!["Normal".into(), "Alarm".into()];
+    sf_fail.enable_change_of_state(true, 1, 0);
     let ahu = device(
         2006,
         "AHU-1",
@@ -172,11 +230,13 @@ fn demo_db() -> SharedDb {
                 PointValue::Binary(true),
             ),
             BacObject::new(ObjectType::BinaryInput, 1, "SF-S", PointValue::Binary(true)),
+            sf_fail,
             multistate(
                 ObjectType::MultiStateInput,
                 "AHU-MODE",
                 &["Off", "Heat", "Cool", "Econ"],
             ),
+            BacObject::notification_class(1, "ALARMS"),
         ],
     );
 

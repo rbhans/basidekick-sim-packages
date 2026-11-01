@@ -9,6 +9,7 @@ description = "BACnet/IP server with a virtual routed network, serving a bask-po
 [dependencies]
 bask-points.workspace = true
 parking_lot.workspace = true
+chrono.workspace = true
 socket2 = { version = "0.6", features = ["all"] }
 
 # Interface listing and local time.
@@ -17,4 +18,3 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 if-addrs = "0.15"
-chrono.workspace = true

@@ -3,11 +3,12 @@
 //! [`Simulation::advance`] a few times a second.
 
 use crate::equip::*;
+use crate::history::{History, Span, Trend};
 use crate::package::{EquipDef, Package};
 use crate::scenario::*;
 use crate::world::{self, Schedule, Season, Weather, hour_of};
 use crate::zone::Zone;
-use bask_points::{PointDb, PointRef, SharedDb};
+use bask_points::{BacObject, PointDb, PointRef, PointValue, SharedDb};
 use chrono::{Datelike, Duration, NaiveDateTime, Weekday};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,6 +16,10 @@ use std::sync::Arc;
 
 /// Longest physics step, sim seconds.
 const MAX_STEP_S: f64 = 1.0;
+/// Points every controller keeps a BACnet trend log of, when it has them.
+const TRENDED: [&str; 11] = [
+    "ZN-T", "ZN-CO2", "ZN-RH", "SA-T", "DSP", "AIRFLOW", "MA-T", "CHWS-T", "HWS-T", "OA-T", "KW",
+];
 const LOG_LEN: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,11 +107,15 @@ pub struct Simulation {
     pub energy: Energy,
     pub people: f64,
     pub occupied: bool,
-    /// The day optimal start brought the HVAC on, and how many minutes
-    /// before opening it did.
-    optimal_start: Option<(chrono::NaiveDate, f64)>,
+    /// The day optimal start brought the HVAC on, how many minutes before
+    /// the schedule did, and when the schedule comes on.
+    optimal_start: Option<(chrono::NaiveDate, f64, NaiveDateTime)>,
     /// Consumption when the package has no meter.
     kwh: f64,
+    history: History,
+    /// Writable settings as the building was built, for putting it back.
+    as_built: Vec<(PointRef, PointValue)>,
+    as_built_schedule: Option<bask_points::Schedule>,
 }
 
 impl Simulation {
@@ -149,7 +158,7 @@ impl Simulation {
                 None,
                 &pkg.location,
             );
-            Site::new(&mut b)
+            Site::new(&mut b, &pkg.schedule)
         };
         let mut kinds = vec![Kind::Site];
         let (mut rtus, mut ahus, mut vavs, mut chillers, mut boilers) =
@@ -257,6 +266,30 @@ impl Simulation {
         for (i, v) in vavs.iter().enumerate() {
             ahus[v.ahu].vavs.push(i);
         }
+        // what a controller keeps on board for a BAS: a trend log of its main
+        // readings, and an alarm when a zone sensor fails or reads absurdly
+        for dev in db.devices.iter_mut() {
+            let mut next = 1;
+            let mut logs = Vec::new();
+            for o in dev.objects.iter_mut() {
+                if o.name == "ZN-T" {
+                    o.enable_out_of_range(40.0, 100.0, 1.0, ALARM_CLASS, 60);
+                }
+                if TRENDED.contains(&o.name.as_str()) {
+                    let mut tl = BacObject::trend_log(
+                        next,
+                        format!("TL-{}", o.name),
+                        (o.object_type, o.instance),
+                        60,
+                        1440,
+                    );
+                    tl.description = format!("{}: a sample a minute for a day", o.description);
+                    logs.push(tl);
+                    next += 1;
+                }
+            }
+            dev.objects.extend(logs);
+        }
 
         let mut zones = zones;
         for r in &rtus {
@@ -296,6 +329,13 @@ impl Simulation {
         };
         let mods = Mods::new(zones.len(), devices);
         let schedule = Schedule::new(package.schedule.clone());
+        // rooms start about as damp as the season makes them, within what
+        // an HVAC system keeps
+        let outside = world::weather(start, Season::for_month(start.month()), 0.0);
+        for z in zones.iter_mut() {
+            z.w = outside.humidity_ratio().clamp(0.003, 0.0095);
+        }
+        let history = History::new(&db);
         let mut sim = Simulation {
             db: Arc::new(Mutex::new(db)),
             now: start - Duration::hours(3),
@@ -331,11 +371,39 @@ impl Simulation {
             occupied: false,
             optimal_start: None,
             kwh: 0.0,
+            history,
+            as_built: Vec::new(),
+            as_built_schedule: None,
             package,
         };
         // settle: run the three hours before the start so loops and loops'
         // water are where they'd be
         sim.run_for(3.0 * 3600.0, 5.0);
+        sim.as_built = {
+            let mut db = sim.db.lock();
+            // nothing from the settling hours goes out on the network
+            db.take_notices();
+            sim.as_built_schedule = db.obj(sim.site.schedule).as_schedule().cloned();
+            db.devices
+                .iter()
+                .enumerate()
+                .flat_map(|(d, dev)| {
+                    dev.objects
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| o.writable)
+                        .map(move |(o, obj)| {
+                            (
+                                PointRef {
+                                    device: d as u16,
+                                    object: o as u16,
+                                },
+                                obj.present_value,
+                            )
+                        })
+                })
+                .collect()
+        };
         sim.alarms = sim.current_alarms();
         sim.log.clear();
         sim.note(
@@ -392,10 +460,11 @@ impl Simulation {
     }
 
     fn step(&mut self, db: &mut PointDb, dt: f64) {
-        self.now += Duration::milliseconds((dt * 1000.0) as i64);
+        self.now += Duration::microseconds((dt * 1e6).round() as i64);
         self.tick_scenarios(dt);
         self.mods = self.build_mods(db);
-        let scheduled = self.scheduled_hvac();
+        db.tick(self.now);
+        let scheduled = self.scheduled_hvac(db);
         let m = &self.mods;
 
         self.weather = world::weather(self.now, self.season, m.oat_delta);
@@ -497,10 +566,11 @@ impl Simulation {
             self.kwh += self.bus.energy.total_kw() * dt / 3600.0;
         }
         self.energy = self.bus.energy.clone();
+        self.history.sample(db, self.now);
 
         if self.occupied != was_occupied && !self.log.is_empty() {
             let text = match self.optimal_start {
-                Some((day, early)) if self.occupied && day == self.now.date() && early > 1.0 => {
+                Some((day, early, _)) if self.occupied && day == self.now.date() && early > 1.0 => {
                     format!("Building occupied: optimal start, {early:.0} min before opening")
                 }
                 _ if self.occupied => "Building occupied".to_string(),
@@ -510,20 +580,28 @@ impl Simulation {
         }
     }
 
-    /// The schedule's occupied mode, with optimal start: the HVAC comes on
-    /// early by about 12 minutes for every degree the worst zone sits
-    /// outside 70–74 °F (never less than the package's lead, at most four
-    /// hours), then stays on until closing.
-    fn scheduled_hvac(&mut self) -> bool {
-        let Some(hours) = self.schedule.hours(self.now) else {
+    /// The occupancy schedule (the site's BACnet schedule object, so a BAS
+    /// can edit it), with optimal start: the HVAC comes on early by about 12
+    /// minutes for every degree the worst zone sits outside 70–74 °F (never
+    /// less than the package's lead, at most four hours) ahead of the
+    /// schedule coming on.
+    fn scheduled_hvac(&mut self, db: &PointDb) -> bool {
+        let sched = db.obj(self.site.schedule);
+        if sched.present_value.as_bool() {
+            return true;
+        }
+        let today = self.now.date();
+        let Some(s) = sched.as_schedule() else {
             return false;
         };
-        let h = hour_of(self.now);
-        let today = self.now.date();
-        if h >= hours.close {
+        let Some((on, true)) = s.next_change(self.now, Duration::hours(4)) else {
             return false;
-        }
-        if self.optimal_start.is_some_and(|(day, _)| day == today) {
+        };
+        // started early for this, and the schedule hasn't been edited since
+        if self
+            .optimal_start
+            .is_some_and(|(day, _, at)| day == today && at == on)
+        {
             return true;
         }
         let behind = self
@@ -533,8 +611,9 @@ impl Simulation {
             .map(|z| (70.0 - z.temp).max(z.temp - 74.0).max(0.0))
             .fold(0.0, f64::max);
         let lead_min = (self.schedule.base_lead_min() + behind * 12.0).min(240.0);
-        if h >= hours.open - lead_min / 60.0 {
-            self.optimal_start = Some((today, (hours.open - h) * 60.0));
+        let ahead_min = (on - self.now).num_seconds() as f64 / 60.0;
+        if ahead_min <= lead_min {
+            self.optimal_start = Some((today, ahead_min, on));
             return true;
         }
         false
@@ -864,6 +943,78 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Puts the building back as built: every BAS command released, every
+    /// point back in service, every setting at its default.
+    pub fn clear_overrides(&mut self) {
+        let mut db = self.db.lock();
+        for dev in db.devices.iter_mut() {
+            for o in dev.objects.iter_mut() {
+                o.priority_array = [None; 16];
+                o.out_of_service = false;
+                o.present_value = o.effective();
+            }
+        }
+        for (r, v) in &self.as_built {
+            db.obj_mut(*r).present_value = *v;
+        }
+        if let (Some(built), Some(s)) = (
+            &self.as_built_schedule,
+            db.obj_mut(self.site.schedule).as_schedule_mut(),
+        ) {
+            *s = built.clone();
+        }
+        let now = self.now;
+        db.obj_mut(self.site.schedule).refresh_schedule(now);
+    }
+
+    /// A write from the app itself, the way a BAS operator would make it:
+    /// commandable points at priority 8, settings directly, and sensors by
+    /// taking them out of service. `None` releases.
+    pub fn command(
+        &mut self,
+        device: usize,
+        point: &str,
+        value: Option<PointValue>,
+    ) -> Result<(), String> {
+        let text = {
+            let mut db = self.db.lock();
+            let dev = db.devices.get_mut(device).ok_or("no such controller")?;
+            let o = dev.find_by_name(point).ok_or("no such point")?;
+            let dev_name = dev.name.clone();
+            let obj = &mut dev.objects[o];
+            let refused = |e| format!("{point} refused it: {e:?}");
+            let what = if obj.commandable {
+                obj.write_present_value(value, Some(8)).map_err(refused)?;
+                match value {
+                    Some(v) => format!("{} @ priority 8", bask_points::format_value(obj, v)),
+                    None => "released priority 8".into(),
+                }
+            } else if obj.object_type.is_input() {
+                match value {
+                    Some(v) => {
+                        let v = obj.coerce(v).map_err(refused)?;
+                        obj.out_of_service = true;
+                        obj.present_value = v;
+                        format!("{}, out of service", bask_points::format_value(obj, v))
+                    }
+                    None => {
+                        obj.out_of_service = false;
+                        "back in service".into()
+                    }
+                }
+            } else if obj.writable {
+                let v = value.ok_or(format!("{point} is a setting: give it a value"))?;
+                obj.write_present_value(Some(v), None).map_err(refused)?;
+                bask_points::format_value(obj, obj.present_value)
+            } else {
+                return Err(format!("{point} is read-only"));
+            };
+            format!("You set {dev_name} {point}: {what}")
+        };
+        self.note(Level::Bacnet, text);
+        Ok(())
+    }
+
     /// Ready-made faults for one controller, as scenarios to start.
     pub fn quick_faults(&self, device: usize) -> Vec<ScenarioDef> {
         let db = self.db.lock();
@@ -1099,6 +1250,38 @@ impl Simulation {
     /// What a mystery fault really is.
     pub fn mystery_answer(&self, id: &str) -> Option<&str> {
         self.mysteries.get(id).map(String::as_str)
+    }
+
+    /// The titles of a controller's trend charts.
+    pub fn chart_titles(&self, device: usize) -> Vec<&'static str> {
+        self.history.titles(device)
+    }
+
+    /// One of a controller's trend charts, the last `span` of it.
+    pub fn trend(&self, device: usize, chart: usize, span: Span) -> Option<Trend> {
+        self.history.trend(device, chart, span, self.now)
+    }
+
+    /// When the BACnet occupancy schedule first comes on today and goes off
+    /// again, exceptions included.
+    pub fn schedule_today(&self) -> Option<(f64, f64)> {
+        let db = self.db.lock();
+        let s = db.obj(self.site.schedule).as_schedule()?;
+        let midnight = self.now.date().and_hms_opt(0, 0, 0)?;
+        let hour = |t: NaiveDateTime| (t - midnight).num_seconds() as f64 / 3600.0;
+        let on = if s.value_at(midnight) {
+            midnight
+        } else {
+            match s.next_change(midnight, Duration::days(1))? {
+                (t, true) => t,
+                _ => return None,
+            }
+        };
+        let off = match s.next_change(on, Duration::days(1)) {
+            Some((t, false)) => hour(t).min(24.0),
+            _ => 24.0,
+        };
+        Some((hour(on), off))
     }
 
     pub fn schedule_hours(&self) -> Option<(f64, f64)> {

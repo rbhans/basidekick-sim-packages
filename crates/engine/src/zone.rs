@@ -2,11 +2,19 @@
 //! lights and plugs on one side, whatever the HVAC blows in on the other.
 
 use crate::package::ZoneDef;
-use crate::world::{Weather, facing_factor};
+use crate::world::{Weather, facing_factor, relative_humidity, saturated};
 
 pub const OUTDOOR_CO2: f64 = 420.0;
 /// Sensible heat per person, BTU/h.
 const PERSON_BTUH: f64 = 250.0;
+/// Water a person breathes and sweats out, lb/h (about 200 BTU/h latent).
+const PERSON_WATER_LB_H: f64 = 0.19;
+/// Pounds of air per cubic foot, and per cfm-hour.
+const AIR_LB_FT3: f64 = 0.075;
+const AIR_LB_PER_CFM_H: f64 = 4.5;
+/// Carpet, furniture and drywall soak up and give back water, so a room's
+/// humidity moves several times slower than its air alone would.
+const MOISTURE_BUFFER: f64 = 8.0;
 
 /// What the HVAC delivers to a zone in one step.
 #[derive(Clone, Debug, Default)]
@@ -14,6 +22,8 @@ pub struct ZoneAir {
     pub cfm: f64,
     /// Σ cfm × supply temperature, to mix several supplies.
     pub cfm_t: f64,
+    /// Σ cfm × supply humidity ratio.
+    pub cfm_w: f64,
     pub oa_cfm: f64,
     /// Heat put straight in (unit heaters), BTU/h.
     pub heat_btuh: f64,
@@ -22,9 +32,11 @@ pub struct ZoneAir {
 }
 
 impl ZoneAir {
-    pub fn supply(&mut self, cfm: f64, temp: f64, oa_fraction: f64) {
+    /// Air in at `temp` carrying `w` lb of water per lb.
+    pub fn supply(&mut self, cfm: f64, temp: f64, w: f64, oa_fraction: f64) {
         self.cfm += cfm;
         self.cfm_t += cfm * temp;
+        self.cfm_w += cfm * w;
         self.oa_cfm += cfm * oa_fraction;
     }
 }
@@ -51,6 +63,8 @@ pub struct Zone {
 
     pub temp: f64,
     pub co2: f64,
+    /// Humidity ratio, lb of water per lb of dry air.
+    pub w: f64,
     pub people: f64,
     pub lights_on: bool,
     /// Last step's delivered air, for display.
@@ -85,6 +99,7 @@ impl Zone {
             infiltration_cfm: def.area_sqft * 0.02 * exposure,
             temp: def.start_temp_f + spread(&def.id, 5),
             co2: 450.0,
+            w: 0.0075,
             people: 0.0,
             lights_on: false,
             supply_cfm: 0.0,
@@ -135,11 +150,25 @@ impl Zone {
             (self.people * self.co2_per_person * 1e6 - oa * (self.co2 - OUTDOOR_CO2)) / self.volume;
         self.co2 = (self.co2 + dc * dt / 60.0).max(OUTDOOR_CO2);
 
+        // water: people add it, leaks trade it with outside, the supply air
+        // brings it in or (off a cooling coil) carries it away
+        let w = self.w;
+        let water_lb_h = self.people * PERSON_WATER_LB_H
+            + AIR_LB_PER_CFM_H * leak_cfm * (weather.humidity_ratio() - w)
+            + AIR_LB_PER_CFM_H * (air.cfm_w - air.cfm * w);
+        let mass = self.volume * AIR_LB_FT3 * MOISTURE_BUFFER;
+        self.w = (w + water_lb_h * dt / 3600.0 / mass).clamp(0.0005, saturated(self.temp));
+
         self.supply_cfm = air.cfm;
         if air.cfm > 1.0 {
             self.supply_temp = air.cfm_t / air.cfm;
         }
         self.setpoints = air.setpoints;
+    }
+
+    /// Relative humidity, %.
+    pub fn rh(&self) -> f64 {
+        relative_humidity(self.temp, self.w)
     }
 
     pub fn lights_kw(&self) -> f64 {

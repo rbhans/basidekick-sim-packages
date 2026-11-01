@@ -1,23 +1,25 @@
 //! The window: buildings and network settings on the left, the running
-//! building in the middle (clock, zones, controllers and their points), the
-//! scenarios and the event log on the right.
+//! building in the middle (clock, zones, controllers with their points and
+//! trend charts), scenarios or lessons and the event log on the right.
 
 use crate::brand::{self, chip, tint};
+use crate::chart::trend_chart;
 use bask_bacnet::NetInterface;
+use bask_points::PointValue;
 use bask_runner::runtime::{NetConfig, Runtime};
 use bask_sim::package::EquipDef;
 use bask_sim::{
-    Category, DeviceSnap, Kind, Level, Package, ScenarioDef, ScenarioSnap, Season, Snapshot,
-    ZoneSnap,
+    Category, DeviceSnap, Kind, LessonDef, Level, Package, PointSnap, ScenarioDef, ScenarioSnap,
+    Season, Snapshot, Span, Trend, Write, ZoneSnap,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::{Disableable, Icon, Selectable, Sizable};
 use gpui_kit::{
-    AnyElement, ClickEvent, Context, Div, ElementId, Entity, FontWeight, Hsla, ScrollHandle,
-    SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, ClickEvent, Context, Div, ElementId, Entity, FontWeight, HighlightStyle, Hsla,
+    ScrollHandle, SharedString, StyledText, Subscription, Task, Window, div, prelude::*, px,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -31,6 +33,12 @@ const JUMPS: [(&str, f64, bool); 5] = [
     ("5 PM", 17.0, true),
     ("10 PM", 22.0, false),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Scenarios,
+    Lessons,
+}
 
 pub struct SimApp {
     packages: Vec<Package>,
@@ -48,15 +56,32 @@ pub struct SimApp {
     error: Option<String>,
     log_scroll: ScrollHandle,
     last_seq: u64,
+    span: Span,
+    /// Which chart each controller shows, and that chart's latest trend.
+    chart_sel: HashMap<usize, usize>,
+    charts: HashMap<usize, (Vec<&'static str>, Option<Trend>)>,
+    /// The point being changed from the app: (controller, point name).
+    editing: Option<(usize, String)>,
+    edit: Entity<InputState>,
+    edit_error: Option<String>,
+    tab: Tab,
+    /// The lesson that's open, its steps ticked off, and lessons whose
+    /// "what you should see" is showing.
+    lesson: Option<String>,
+    steps_done: HashSet<(String, usize)>,
+    expect_shown: HashSet<String>,
     _poll: Task<()>,
     _quit: Subscription,
+    _edit: Subscription,
 }
 
 impl SimApp {
-    /// `package` preselects a building by id; `start` starts it right away.
+    /// `package` preselects a building by id; `start` starts it right away;
+    /// `lesson` starts it set up for that lesson.
     pub fn new(
         package: Option<&str>,
         start: bool,
+        lesson: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -80,6 +105,12 @@ impl SimApp {
             }
             async {}
         });
+        let edit = cx.new(|cx| InputState::new(window, cx));
+        let edit_sub = cx.subscribe_in(&edit, window, |this, _, e: &InputEvent, _, cx| {
+            if let InputEvent::PressEnter { .. } = e {
+                this.submit_number(cx);
+            }
+        });
         let mut app = SimApp {
             packages,
             package_errors,
@@ -95,10 +126,24 @@ impl SimApp {
             error: None,
             log_scroll: ScrollHandle::new(),
             last_seq: 0,
+            span: Span::default(),
+            chart_sel: HashMap::new(),
+            charts: HashMap::new(),
+            editing: None,
+            edit,
+            edit_error: None,
+            tab: Tab::Scenarios,
+            lesson: None,
+            steps_done: HashSet::new(),
+            expect_shown: HashSet::new(),
             _poll: poll,
             _quit: quit,
+            _edit: edit_sub,
         };
-        if start {
+        if let Some(id) = lesson {
+            app.tab = Tab::Lessons;
+            app.run_lesson(id, cx);
+        } else if start {
             app.start(cx);
         }
         app
@@ -118,6 +163,7 @@ impl SimApp {
                     self.last_seq = newest;
                 }
                 self.snap = Some(snap);
+                self.refresh_charts();
                 cx.notify();
             }
             None if tick.is_multiple_of(20) => {
@@ -207,17 +253,136 @@ impl SimApp {
             f(&mut rt.sim.lock());
             self.snap = Some(rt.sim.lock().snapshot());
         }
+        self.refresh_charts();
         cx.notify();
+    }
+
+    fn open_device(&mut self, ix: usize) {
+        self.expanded.insert(ix);
+        if let Some(rt) = &self.runtime {
+            let faults = rt.sim.lock().quick_faults(ix);
+            self.quick.insert(ix, faults);
+        }
     }
 
     fn toggle_device(&mut self, ix: usize, cx: &mut Context<Self>) {
         if !self.expanded.remove(&ix) {
-            self.expanded.insert(ix);
-            if let Some(rt) = &self.runtime {
-                let faults = rt.sim.lock().quick_faults(ix);
-                self.quick.insert(ix, faults);
+            self.open_device(ix);
+        }
+        self.refresh_charts();
+        cx.notify();
+    }
+
+    /// The controller the open lesson is about.
+    fn lesson_device(&self) -> Option<usize> {
+        let lesson = self.open_lesson()?;
+        let name = lesson.setup.device.as_deref()?;
+        self.snap
+            .as_ref()?
+            .devices
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.index)
+    }
+
+    fn open_lesson(&self) -> Option<&LessonDef> {
+        let id = self.lesson.as_deref()?;
+        self.packages[self.selected]
+            .lessons
+            .iter()
+            .find(|l| l.id == id)
+    }
+
+    /// Fresh trends for every chart on screen.
+    fn refresh_charts(&mut self) {
+        self.charts.clear();
+        let Some(rt) = &self.runtime else { return };
+        let sim = rt.sim.lock();
+        let shown = self.expanded.iter().copied().chain(self.lesson_device());
+        for d in shown {
+            let titles = sim.chart_titles(d);
+            let sel = self.chart_sel.get(&d).copied().unwrap_or(0);
+            let trend = sim.trend(d, sel, self.span);
+            self.charts.insert(d, (titles, trend));
+        }
+    }
+
+    // ---- changing points from the app ---------------------------------------
+
+    fn begin_edit(
+        &mut self,
+        device: usize,
+        p: &PointSnap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing = Some((device, p.name.clone()));
+        self.edit_error = None;
+        let text = p.number.map(|v| {
+            let t = format!("{v:.2}");
+            t.trim_end_matches('0').trim_end_matches('.').to_string()
+        });
+        self.edit.update(cx, |input, cx| {
+            input.set_value(text.unwrap_or_default(), window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn submit(&mut self, value: Option<PointValue>, cx: &mut Context<Self>) {
+        let Some((device, point)) = self.editing.clone() else {
+            return;
+        };
+        let mut result = Ok(());
+        self.with_sim(cx, |sim| result = sim.command(device, &point, value));
+        match result {
+            Ok(()) => {
+                self.editing = None;
+                self.edit_error = None;
+            }
+            Err(e) => self.edit_error = Some(e),
+        }
+        cx.notify();
+    }
+
+    fn submit_number(&mut self, cx: &mut Context<Self>) {
+        let text = self.edit.read(cx).value();
+        match text.trim().parse::<f32>() {
+            Ok(v) => self.submit(Some(PointValue::Real(v)), cx),
+            Err(_) => {
+                self.edit_error = Some(format!("{text:?} isn't a number"));
+                cx.notify();
             }
         }
+    }
+
+    // ---- lessons -------------------------------------------------------------
+
+    /// Starts the building if it isn't running, then sets the lesson up and
+    /// opens the controller it's about.
+    fn run_lesson(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.runtime.is_none() {
+            self.start(cx);
+        }
+        let mut result = Ok(());
+        self.with_sim(cx, |sim| result = sim.start_lesson(&id));
+        if let Err(e) = result {
+            self.error = Some(e);
+        }
+        self.lesson = Some(id.clone());
+        self.steps_done.retain(|(l, _)| *l != id);
+        self.expect_shown.remove(&id);
+        let setup = self.open_lesson().map(|l| l.setup.clone());
+        if let (Some(setup), Some(d)) = (setup, self.lesson_device()) {
+            self.open_device(d);
+            if let (Some(chart), Some(rt)) = (&setup.chart, &self.runtime) {
+                let titles = rt.sim.lock().chart_titles(d);
+                if let Some(i) = titles.iter().position(|t| t == chart) {
+                    self.chart_sel.insert(d, i);
+                }
+            }
+        }
+        self.refresh_charts();
         cx.notify();
     }
 
@@ -654,10 +819,17 @@ impl SimApp {
         } else {
             chip("UNOCCUPIED", brand::ink_2(), brand::panel_2())
         };
-        let hours = match snap.hours {
+        let mut hours = match snap.hours {
             Some((open, close)) => format!("open {}–{}", hhmm(open), hhmm(close)),
             None => "closed today".into(),
         };
+        // a BAS edited the occupancy schedule
+        if snap.schedule != snap.hours {
+            hours.push_str(&match snap.schedule {
+                Some((on, off)) => format!(" · schedule {}–{}", hhmm(on), hhmm(off)),
+                None => " · schedule off today".into(),
+            });
+        }
         let speeds = SPEEDS.iter().enumerate().map(|(i, &s)| {
             segment(
                 ("speed", i),
@@ -898,6 +1070,15 @@ impl SimApp {
                     )
                     .child(
                         div()
+                            .text_color(if z.rh > 60.0 {
+                                brand::fault()
+                            } else {
+                                brand::ink_2()
+                            })
+                            .child(format!("{:.0} % RH", z.rh)),
+                    )
+                    .child(
+                        div()
                             .text_color(brand::ink_2())
                             .child(format!("{:.0} ppl", z.people)),
                     )
@@ -1030,57 +1211,84 @@ impl SimApp {
             .when(!d.online, |r| r.opacity(0.6))
             .child(head);
         if open {
-            let points =
-                d.points.iter().enumerate().map(|(i, p)| {
-                    let mut flags: Vec<Div> = Vec::new();
-                    if let Some(pr) = p.priority {
-                        flags.push(chip(format!("P{pr}"), brand::paper(), brand::hand()));
-                    }
-                    if p.out_of_service {
-                        flags.push(chip("OOS", brand::paper(), brand::hand()));
-                    }
-                    if p.fault {
-                        flags.push(chip("FAULT", brand::ink(), brand::fault()));
-                    }
-                    if p.alarm {
-                        flags.push(chip("ALARM", brand::paper(), brand::alarm()));
-                    }
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .py_1()
-                        .text_sm()
-                        .when(i % 2 == 1, |r| r.bg(tint(brand::well(), 0.5)))
-                        .child(mono(p.name.clone()).w(px(130.)).flex_none())
-                        .child(
-                            mono(format!("{} {}", p.kind, p.instance))
-                                .w(px(64.))
-                                .flex_none()
-                                .text_xs()
-                                .text_color(brand::ink_3()),
-                        )
-                        .child(mono(p.value.clone()).w(px(120.)).flex_none().text_color(
-                            if p.alarm {
-                                brand::alarm()
-                            } else if p.priority.is_some() {
-                                hand_text()
-                            } else {
-                                brand::paper()
-                            },
-                        ))
-                        .child(div().flex().gap_1().w(px(110.)).flex_none().children(flags))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_xs()
-                                .text_color(brand::ink_3())
-                                .child(p.description.clone()),
-                        )
-                });
+            let editing = self
+                .editing
+                .as_ref()
+                .filter(|(dev, _)| *dev == ix)
+                .map(|(_, name)| name.clone());
+            let mut points: Vec<AnyElement> = Vec::new();
+            for (i, p) in d.points.iter().enumerate() {
+                let mut flags: Vec<Div> = Vec::new();
+                if let Some(pr) = p.priority {
+                    flags.push(chip(format!("P{pr}"), brand::paper(), brand::hand()));
+                }
+                if p.out_of_service {
+                    flags.push(chip("OOS", brand::paper(), brand::hand()));
+                }
+                if p.fault {
+                    flags.push(chip("FAULT", brand::ink(), brand::fault()));
+                }
+                if p.alarm {
+                    flags.push(chip("ALARM", brand::paper(), brand::alarm()));
+                }
+                let row_el = div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .when(i % 2 == 1, |r| r.bg(tint(brand::well(), 0.5)))
+                    .child(mono(p.name.clone()).w(px(130.)).flex_none())
+                    .child(
+                        mono(format!("{} {}", p.kind, p.instance))
+                            .w(px(64.))
+                            .flex_none()
+                            .text_xs()
+                            .text_color(brand::ink_3()),
+                    )
+                    .child({
+                        let value = mono(p.value.clone()).text_color(if p.alarm {
+                            brand::alarm()
+                        } else if p.priority.is_some() || p.out_of_service {
+                            hand_text()
+                        } else {
+                            brand::paper()
+                        });
+                        let cell = div()
+                            .id(ElementId::Name(format!("pv-{ix}-{i}").into()))
+                            .w(px(120.))
+                            .flex_none()
+                            .child(value);
+                        if p.write == Write::ReadOnly {
+                            cell
+                        } else {
+                            let snap = p.clone();
+                            cell.cursor_pointer()
+                                .rounded_sm()
+                                .border_b_1()
+                                .border_color(brand::line_2())
+                                .hover(|c| c.bg(brand::panel_2()))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.begin_edit(ix, &snap, window, cx)
+                                }))
+                        }
+                    })
+                    .child(div().flex().gap_1().w(px(110.)).flex_none().children(flags))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(brand::ink_3())
+                            .child(p.description.clone()),
+                    );
+                points.push(row_el.into_any_element());
+                if editing.as_deref() == Some(p.name.as_str()) {
+                    points.push(self.point_editor(p, cx).into_any_element());
+                }
+            }
             let faults = self.quick.get(&ix).map(|faults| {
                 div()
                     .flex()
@@ -1134,11 +1342,153 @@ impl SimApp {
                             .text_color(brand::ink_3())
                             .child(d.description.clone()),
                     )
+                    .children(self.chart_panel(ix, 170., cx))
                     .children(points)
                     .children(faults),
             );
         }
         row.into_any_element()
+    }
+
+    /// A controller's trend chart, with its chart picker and time span.
+    fn chart_panel(&self, ix: usize, height: f32, cx: &mut Context<Self>) -> Option<Div> {
+        let (titles, trend) = self.charts.get(&ix)?;
+        if titles.is_empty() {
+            return None;
+        }
+        let sel = self.chart_sel.get(&ix).copied().unwrap_or(0);
+        let picks = titles.iter().enumerate().map(|(c, title)| {
+            segment(
+                ElementId::Name(format!("chart-{ix}-{c}").into()),
+                title,
+                c == sel,
+            )
+            .xsmall()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.chart_sel.insert(ix, c);
+                this.refresh_charts();
+                cx.notify();
+            }))
+        });
+        let spans = Span::ALL.iter().map(|&span| {
+            segment(
+                ElementId::Name(format!("span-{ix}-{}", span.label()).into()),
+                span.label(),
+                span == self.span,
+            )
+            .xsmall()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.span = span;
+                this.refresh_charts();
+                cx.notify();
+            }))
+        });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(brand::line())
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .child(segments().children(picks))
+                        .child(div().flex_1())
+                        .child(segments().children(spans)),
+                )
+                .children(trend.as_ref().map(|t| trend_chart(t, self.span, height))),
+        )
+    }
+
+    /// The row under a point being changed: a value box or its states, and
+    /// a way to hand it back.
+    fn point_editor(&self, p: &PointSnap, cx: &mut Context<Self>) -> Div {
+        let (how, release) = match p.write {
+            Write::Command => (
+                "Writes at priority 8, as an operator would.",
+                p.priority == Some(8),
+            ),
+            Write::Setting => ("A setting: it keeps the value until changed.", false),
+            Write::Sensor => (
+                "Takes the sensor out of service at this value. The controller acts on it.",
+                p.out_of_service,
+            ),
+            Write::ReadOnly => ("", false),
+        };
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(tint(brand::hand(), 0.08))
+            .border_y_1()
+            .border_color(tint(brand::hand(), 0.4));
+        if p.number.is_some() {
+            row = row
+                .child(div().w(px(110.)).child(Input::new(&self.edit).small()))
+                .child(
+                    Button::new("edit-set")
+                        .primary()
+                        .xsmall()
+                        .label("Set")
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_number(cx))),
+                );
+        } else {
+            let binary = p.states.len() == 2 && p.kind.starts_with('B');
+            for (i, state) in p.states.iter().enumerate() {
+                let value = if binary {
+                    PointValue::Binary(i == 1)
+                } else {
+                    PointValue::Multi(i as u32 + 1)
+                };
+                row = row.child(
+                    Button::new(ElementId::Name(format!("edit-state-{i}").into()))
+                        .outline()
+                        .xsmall()
+                        .label(state.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| this.submit(Some(value), cx))),
+                );
+            }
+        }
+        if release {
+            row = row.child(
+                Button::new("edit-release")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Undo2)
+                    .label(if p.write == Write::Sensor {
+                        "Back in service"
+                    } else {
+                        "Release"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.submit(None, cx))),
+            );
+        }
+        row.child(
+            Button::new("edit-cancel")
+                .ghost()
+                .xsmall()
+                .label("Cancel")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.editing = None;
+                    this.edit_error = None;
+                    cx.notify();
+                })),
+        )
+        .child(div().text_xs().text_color(brand::ink_3()).child(how))
+        .children(
+            self.edit_error
+                .clone()
+                .map(|e| div().w_full().text_xs().text_color(brand::fault()).child(e)),
+        )
     }
 
     fn dashboard(&self, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1333,6 +1683,199 @@ impl SimApp {
             .children(answer)
     }
 
+    fn lessons_panel(&self, cx: &mut Context<Self>) -> Div {
+        let pkg = &self.packages[self.selected];
+        let running = self.runtime.is_some();
+        let Some(lesson) = self.open_lesson() else {
+            let cards = pkg.lessons.iter().map(|l| {
+                let id = l.id.clone();
+                div()
+                    .id(ElementId::Name(format!("lesson-{}", l.id).into()))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(brand::line())
+                    .bg(brand::panel())
+                    .hover(|c| c.bg(brand::panel_2()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.lesson = Some(id.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(l.title.clone()),
+                            )
+                            .child(level_chip(&l.level)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(brand::ink_3())
+                            .child(l.goal.clone()),
+                    )
+            });
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().text_xs().text_color(brand::ink_3()).child(if pkg.lessons.is_empty() {
+                    "This building has no lessons. Scenarios and the Break it faults still work."
+                } else {
+                    "Short guided exercises. Each one sets the building up, says what to do and what you should see. Use your BAS, or click a point's value here to change it."
+                }))
+                .children(cards);
+        };
+
+        let id = lesson.id.clone();
+        let steps: Vec<_> = lesson
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let done = self.steps_done.contains(&(id.clone(), i));
+                let key = (id.clone(), i);
+                div()
+                    .id(ElementId::Name(format!("step-{id}-{i}").into()))
+                    .cursor_pointer()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .hover(|c| c.bg(brand::panel_2()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if !this.steps_done.remove(&key) {
+                            this.steps_done.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt(px(2.))
+                            .size(px(14.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if done {
+                                brand::accent()
+                            } else {
+                                brand::ink_3()
+                            })
+                            .when(done, |c| c.bg(brand::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(brand::ink())
+                            .when(done, |c| c.child(Icon::new(IconName::Check).size_3())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(if done { brand::ink_3() } else { brand::paper() })
+                            .child(rich(step)),
+                    )
+            })
+            .collect();
+        let shown = self.expect_shown.contains(&id);
+        let toggle_id = id.clone();
+        let run_id = id.clone();
+        let device = lesson.setup.device.clone();
+        let chart = self
+            .lesson_device()
+            .filter(|_| running)
+            .and_then(|d| self.chart_panel(d, 120., cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                Button::new("lessons-back")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronLeft)
+                    .label("All lessons")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.lesson = None;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::BOLD)
+                            .child(lesson.title.clone()),
+                    )
+                    .child(level_chip(&lesson.level)),
+            )
+            .child(div().text_sm().text_color(brand::ink_2()).child(lesson.goal.clone()))
+            .child(
+                Button::new("lesson-run")
+                    .primary()
+                    .small()
+                    .icon(IconName::Play)
+                    .label(if running {
+                        "Set it up"
+                    } else {
+                        "Start the building and set it up"
+                    })
+                    .tooltip("Puts the building back as built, then sets the season, time, speed and any scenario this lesson needs")
+                    .on_click(cx.listener(move |this, _, _, cx| this.run_lesson(run_id.clone(), cx))),
+            )
+            .children(device.filter(|_| chart.is_some()).map(|d| {
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .font_family(brand::MONO_FONT)
+                    .text_color(brand::accent())
+                    .child(format!("// {d}"))
+            }))
+            .children(chart.map(|c| {
+                c.rounded_lg()
+                    .border_1()
+                    .border_color(brand::line())
+                    .bg(brand::well())
+            }))
+            .child(category_title("Steps"))
+            .children(steps)
+            .child(category_title("What you should see"))
+            .child(if shown {
+                div()
+                    .text_sm()
+                    .text_color(brand::ink_2())
+                    .child(rich(&lesson.expect))
+                    .into_any_element()
+            } else {
+                Button::new("lesson-expect")
+                    .outline()
+                    .xsmall()
+                    .icon(IconName::Eye)
+                    .label("Show me")
+                    .tooltip("Try it first, then check")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expect_shown.insert(toggle_id.clone());
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+    }
+
     fn right_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.runtime.is_some();
         // stopped: preview the catalog the package will have
@@ -1363,6 +1906,7 @@ impl SimApp {
             }
         };
         let any_active = scenarios.iter().any(|s| s.active && !s.ending);
+        let lessons = self.packages[self.selected].lessons.len();
         let quick: Vec<&ScenarioSnap> = scenarios.iter().filter(|s| s.quick).collect();
         let mystery = div()
             .flex()
@@ -1502,36 +2046,77 @@ impl SimApp {
                     .flex_col()
                     .gap_2()
                     .child(
-                        section_title("Scenarios")
-                            .when(running, |d| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(28.))
+                            .child(
+                                segments()
+                                    .child(
+                                        segment(
+                                            "tab-scenarios",
+                                            "Scenarios",
+                                            self.tab == Tab::Scenarios,
+                                        )
+                                        .xsmall()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.tab = Tab::Scenarios;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        segment(
+                                            "tab-lessons",
+                                            &format!("Lessons {}", lessons),
+                                            self.tab == Tab::Lessons,
+                                        )
+                                        .xsmall()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.tab = Tab::Lessons;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(div().flex_1())
+                            .when(self.tab == Tab::Scenarios && running, |d| {
                                 let n = scenarios.iter().filter(|s| s.active && !s.ending).count();
                                 d.child(if n == 0 {
                                     chip("ALL NORMAL", brand::ink(), brand::ok())
                                 } else {
                                     chip(format!("{n} RUNNING"), brand::ink(), brand::accent())
                                 })
-                            })
-                            .child(
-                                Button::new("stop-all")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Eraser)
-                                    .label("Stop all")
-                                    .disabled(!any_active)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.with_sim(cx, |sim| sim.stop_all())
-                                    })),
-                            ),
+                                .child(
+                                    Button::new("stop-all")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Eraser)
+                                        .tooltip("Stop every scenario and fault")
+                                        .disabled(!any_active)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.with_sim(cx, |sim| sim.stop_all())
+                                        })),
+                                )
+                            }),
                     )
-                    .when(!running, |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(brand::ink_3())
-                                .child("Start the building to run these."),
-                        )
+                    .when(self.tab == Tab::Scenarios, |d| {
+                        d.when(!running, |d| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(brand::ink_3())
+                                    .child("Start the building to run these."),
+                            )
+                        })
+                        .child(list)
                     })
-                    .child(list),
+                    .when(self.tab == Tab::Lessons, |d| {
+                        d.child(self.lessons_panel(cx))
+                    }),
             )
             .children(log)
     }
@@ -1621,6 +2206,36 @@ fn hhmm(h: f64) -> String {
     } else {
         format!("{h12}:{mm:02} {ampm}")
     }
+}
+
+/// Lesson text with its `POINT-NAMES` picked out.
+fn rich(text: &str) -> StyledText {
+    let mut plain = String::with_capacity(text.len());
+    let mut marks = Vec::new();
+    for (i, part) in text.split('`').enumerate() {
+        let start = plain.len();
+        plain.push_str(part);
+        if i % 2 == 1 {
+            marks.push((
+                start..plain.len(),
+                HighlightStyle {
+                    color: Some(brand::accent()),
+                    font_weight: Some(FontWeight::SEMIBOLD),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    StyledText::new(plain).with_highlights(marks)
+}
+
+fn level_chip(level: &str) -> Div {
+    let (fg, bg) = match level {
+        "Advanced" => (brand::paper(), brand::alarm()),
+        "Intermediate" => (brand::ink(), brand::fault()),
+        _ => (brand::ink(), brand::ok()),
+    };
+    chip(level.to_uppercase(), fg, bg)
 }
 
 fn mono(text: impl Into<SharedString>) -> Div {

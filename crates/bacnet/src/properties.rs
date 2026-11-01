@@ -2,34 +2,49 @@
 //!
 //! Which properties an object has depends on its type and on the object
 //! itself: min/max-pres-value only when limits are set, the priority array
-//! only when commandable. That one list drives everything else: reads of
-//! ALL/REQUIRED/OPTIONAL, property-list, and unknown-property errors.
+//! only when commandable, the alarm properties only with intrinsic reporting.
+//! That one list drives everything else: reads of ALL/REQUIRED/OPTIONAL,
+//! property-list, and unknown-property errors. Schedule, trend log and
+//! alarm properties are encoded in their own modules.
 
 use crate::apdu::{BacError, MAX_APDU};
-use crate::clock;
 use crate::encoding::*;
-use bask_points::{BacDevice, BacObject, ObjectType, PointDb, PointValue};
+use crate::{alarm, clock, schedule, trend};
+use bask_points::{BacDevice, BacObject, EventAlgorithm, ObjectType, PointDb, PointValue};
 
 /// BACnetPropertyIdentifier values used here.
 pub mod prop {
+    pub const ACKED_TRANSITIONS: u32 = 0;
+    pub const ACK_REQUIRED: u32 = 1;
     pub const ACTIVE_TEXT: u32 = 4;
+    pub const ALARM_VALUE: u32 = 6;
     pub const ALL: u32 = 8;
     pub const APDU_TIMEOUT: u32 = 11;
     pub const APPLICATION_SOFTWARE_VERSION: u32 = 12;
+    pub const NOTIFICATION_CLASS: u32 = 17;
     pub const COV_INCREMENT: u32 = 22;
     pub const DAYLIGHT_SAVINGS_STATUS: u32 = 24;
+    pub const DEADBAND: u32 = 25;
     pub const DESCRIPTION: u32 = 28;
     pub const DEVICE_ADDRESS_BINDING: u32 = 30;
+    pub const EFFECTIVE_PERIOD: u32 = 32;
+    pub const EVENT_ENABLE: u32 = 35;
     pub const EVENT_STATE: u32 = 36;
+    pub const EXCEPTION_SCHEDULE: u32 = 38;
     pub const FIRMWARE_REVISION: u32 = 44;
+    pub const HIGH_LIMIT: u32 = 45;
     pub const INACTIVE_TEXT: u32 = 46;
+    pub const LIMIT_ENABLE: u32 = 52;
+    pub const LIST_OF_OBJECT_PROPERTY_REFERENCES: u32 = 54;
     pub const LOCAL_DATE: u32 = 56;
     pub const LOCAL_TIME: u32 = 57;
     pub const LOCATION: u32 = 58;
+    pub const LOW_LIMIT: u32 = 59;
     pub const MAX_APDU_LENGTH_ACCEPTED: u32 = 62;
     pub const MAX_PRES_VALUE: u32 = 65;
     pub const MIN_PRES_VALUE: u32 = 69;
     pub const MODEL_NAME: u32 = 70;
+    pub const NOTIFY_TYPE: u32 = 72;
     pub const NUMBER_OF_APDU_RETRIES: u32 = 73;
     pub const NUMBER_OF_STATES: u32 = 74;
     pub const OBJECT_IDENTIFIER: u32 = 75;
@@ -40,10 +55,13 @@ pub mod prop {
     pub const OUT_OF_SERVICE: u32 = 81;
     pub const POLARITY: u32 = 84;
     pub const PRESENT_VALUE: u32 = 85;
+    pub const PRIORITY: u32 = 86;
     pub const PRIORITY_ARRAY: u32 = 87;
+    pub const PRIORITY_FOR_WRITING: u32 = 88;
     pub const PROTOCOL_OBJECT_TYPES_SUPPORTED: u32 = 96;
     pub const PROTOCOL_SERVICES_SUPPORTED: u32 = 97;
     pub const PROTOCOL_VERSION: u32 = 98;
+    pub const RECIPIENT_LIST: u32 = 102;
     pub const RELIABILITY: u32 = 103;
     pub const RELINQUISH_DEFAULT: u32 = 104;
     pub const REQUIRED: u32 = 105;
@@ -51,12 +69,26 @@ pub mod prop {
     pub const STATE_TEXT: u32 = 110;
     pub const STATUS_FLAGS: u32 = 111;
     pub const SYSTEM_STATUS: u32 = 112;
+    pub const TIME_DELAY: u32 = 113;
     pub const UNITS: u32 = 117;
     pub const UTC_OFFSET: u32 = 119;
     pub const VENDOR_IDENTIFIER: u32 = 120;
     pub const VENDOR_NAME: u32 = 121;
+    pub const WEEKLY_SCHEDULE: u32 = 123;
+    pub const BUFFER_SIZE: u32 = 126;
+    pub const EVENT_TIME_STAMPS: u32 = 130;
+    pub const LOG_BUFFER: u32 = 131;
+    pub const LOG_DEVICE_OBJECT_PROPERTY: u32 = 132;
+    pub const ENABLE: u32 = 133;
+    pub const LOG_INTERVAL: u32 = 134;
     pub const PROTOCOL_REVISION: u32 = 139;
+    pub const RECORD_COUNT: u32 = 141;
+    pub const STOP_WHEN_FULL: u32 = 144;
+    pub const TOTAL_RECORD_COUNT: u32 = 145;
     pub const DATABASE_REVISION: u32 = 155;
+    pub const SCHEDULE_DEFAULT: u32 = 174;
+    pub const LOGGING_TYPE: u32 = 197;
+    pub const EVENT_DETECTION_ENABLE: u32 = 353;
     pub const PROPERTY_LIST: u32 = 371;
     pub const CURRENT_COMMAND_PRIORITY: u32 = 431;
 }
@@ -67,10 +99,12 @@ use prop::*;
 pub const SEGMENTATION_NONE: u32 = 3;
 
 /// BACnetServicesSupported bits for what the devices execute: the confirmed
-/// services they answer, the unconfirmed ones they act on, and the COV
+/// services they answer, the unconfirmed ones they act on, and the
 /// notifications they send.
-const SERVICES_SUPPORTED: [usize; 13] = [
+const SERVICES_SUPPORTED: [usize; 18] = [
+    0,  // acknowledgeAlarm
     1,  // confirmedCOVNotification
+    2,  // confirmedEventNotification
     5,  // subscribeCOV
     12, // readProperty
     14, // readPropertyMultiple
@@ -81,8 +115,11 @@ const SERVICES_SUPPORTED: [usize; 13] = [
     26, // i-Am
     27, // i-Have
     28, // unconfirmedCOVNotification
+    29, // unconfirmedEventNotification
     33, // who-Has
     34, // who-Is
+    35, // readRange
+    39, // getEventInformation
 ];
 /// Bit count for Protocol_Revision 14 (through getEventInformation, writeGroup).
 const SERVICES_BITS: usize = 41;
@@ -165,16 +202,52 @@ pub fn properties(d: &BacDevice, target: Target) -> (Vec<u32>, Vec<u32>) {
         Target::Object(i) => &d.objects[i],
     };
     let t = o.object_type;
-    let mut required = vec![
-        OBJECT_IDENTIFIER,
-        OBJECT_NAME,
-        OBJECT_TYPE,
-        PRESENT_VALUE,
-        STATUS_FLAGS,
-        EVENT_STATE,
-        OUT_OF_SERVICE,
-    ];
-    let mut optional = vec![DESCRIPTION, RELIABILITY];
+    let mut required = vec![OBJECT_IDENTIFIER, OBJECT_NAME, OBJECT_TYPE];
+    let mut optional = vec![DESCRIPTION];
+    match t {
+        ObjectType::Schedule => {
+            required.extend([
+                PRESENT_VALUE,
+                EFFECTIVE_PERIOD,
+                SCHEDULE_DEFAULT,
+                LIST_OF_OBJECT_PROPERTY_REFERENCES,
+                PRIORITY_FOR_WRITING,
+                STATUS_FLAGS,
+                RELIABILITY,
+                OUT_OF_SERVICE,
+            ]);
+            optional.extend([WEEKLY_SCHEDULE, EXCEPTION_SCHEDULE, EVENT_STATE]);
+        }
+        ObjectType::TrendLog => {
+            required.extend([
+                ENABLE,
+                STOP_WHEN_FULL,
+                BUFFER_SIZE,
+                LOG_BUFFER,
+                RECORD_COUNT,
+                TOTAL_RECORD_COUNT,
+                LOGGING_TYPE,
+                STATUS_FLAGS,
+                EVENT_STATE,
+            ]);
+            optional.extend([LOG_DEVICE_OBJECT_PROPERTY, LOG_INTERVAL]);
+        }
+        ObjectType::NotificationClass => {
+            required.extend([NOTIFICATION_CLASS, PRIORITY, ACK_REQUIRED, RECIPIENT_LIST]);
+        }
+        _ => {
+            required.extend([PRESENT_VALUE, STATUS_FLAGS, EVENT_STATE, OUT_OF_SERVICE]);
+            optional.push(RELIABILITY);
+            point_properties(o, &mut required, &mut optional);
+        }
+    }
+    required.push(PROPERTY_LIST);
+    (required, optional)
+}
+
+/// The type-dependent properties of the value objects.
+fn point_properties(o: &BacObject, required: &mut Vec<u32>, optional: &mut Vec<u32>) {
+    let t = o.object_type;
     if t.is_analog() {
         required.push(UNITS);
         optional.push(COV_INCREMENT);
@@ -200,8 +273,22 @@ pub fn properties(d: &BacDevice, target: Target) -> (Vec<u32>, Vec<u32>) {
     if o.commandable {
         required.extend([PRIORITY_ARRAY, RELINQUISH_DEFAULT, CURRENT_COMMAND_PRIORITY]);
     }
-    required.push(PROPERTY_LIST);
-    (required, optional)
+    if let Some(r) = &o.reporting {
+        optional.extend([TIME_DELAY, NOTIFICATION_CLASS]);
+        match r.algorithm {
+            EventAlgorithm::OutOfRange { .. } => {
+                optional.extend([HIGH_LIMIT, LOW_LIMIT, DEADBAND, LIMIT_ENABLE])
+            }
+            EventAlgorithm::ChangeOfState { .. } => optional.push(ALARM_VALUE),
+        }
+        optional.extend([
+            EVENT_ENABLE,
+            ACKED_TRANSITIONS,
+            NOTIFY_TYPE,
+            EVENT_TIME_STAMPS,
+            EVENT_DETECTION_ENABLE,
+        ]);
+    }
 }
 
 pub fn has_property(d: &BacDevice, target: Target, property: u32) -> bool {
@@ -227,7 +314,14 @@ fn property_list(d: &BacDevice, target: Target) -> Vec<u32> {
 pub fn is_array(property: u32) -> bool {
     matches!(
         property,
-        OBJECT_LIST | PRIORITY_ARRAY | STATE_TEXT | PROPERTY_LIST
+        OBJECT_LIST
+            | PRIORITY_ARRAY
+            | STATE_TEXT
+            | PROPERTY_LIST
+            | WEEKLY_SCHEDULE
+            | EXCEPTION_SCHEDULE
+            | EVENT_TIME_STAMPS
+            | PRIORITY
     )
 }
 
@@ -244,13 +338,12 @@ pub fn read(
     if !has_property(d, target, property) {
         return Err(BacError::UNKNOWN_PROPERTY);
     }
+    // The log buffer is read with ReadRange only.
+    if property == LOG_BUFFER {
+        return Err(BacError::READ_ACCESS_DENIED);
+    }
     if is_array(property) {
-        let len = match (target, property) {
-            (_, PROPERTY_LIST) => property_list(d, target).len(),
-            (Target::Device, _) => d.objects.len() + 1,
-            (Target::Object(i), PRIORITY_ARRAY) => d.objects[i].priority_array.len(),
-            (Target::Object(i), _) => d.objects[i].states.len(),
-        };
+        let len = array_len(d, target, property);
         match index {
             None => (0..len).for_each(|i| element(d, target, property, i, buf)),
             Some(0) => app_unsigned(buf, len as u64),
@@ -269,6 +362,21 @@ pub fn read(
     Ok(())
 }
 
+pub fn array_len(d: &BacDevice, target: Target, property: u32) -> usize {
+    match (target, property) {
+        (_, PROPERTY_LIST) => property_list(d, target).len(),
+        (Target::Device, _) => d.objects.len() + 1,
+        (Target::Object(i), PRIORITY_ARRAY) => d.objects[i].priority_array.len(),
+        (Target::Object(i), STATE_TEXT) => d.objects[i].states.len(),
+        (Target::Object(i), _) => {
+            let o = &d.objects[i];
+            schedule::array_len(o, property)
+                .or_else(|| alarm::array_len(o, property))
+                .unwrap_or(0)
+        }
+    }
+}
+
 /// One element (0-based) of an array property.
 fn element(d: &BacDevice, target: Target, property: u32, i: usize, buf: &mut Vec<u8>) {
     match (target, property) {
@@ -282,11 +390,18 @@ fn element(d: &BacDevice, target: Target, property: u32, i: usize, buf: &mut Vec
                 None => app_null(buf),
             }
         }
-        (Target::Object(o), _) => app_char_string(buf, &d.objects[o].states[i]),
+        (Target::Object(o), STATE_TEXT) => app_char_string(buf, &d.objects[o].states[i]),
+        (Target::Object(o), _) => {
+            let o = &d.objects[o];
+            if !schedule::element(o, property, i, buf) && !alarm::element(o, property, i, buf) {
+                unreachable!("array {property} listed but not encoded");
+            }
+        }
     }
 }
 
-/// A present value in its object type's BACnet data type.
+/// A present value in its object type's BACnet data type. Schedules hold
+/// BACnetBinaryPV, like binary objects.
 pub fn encode_value(buf: &mut Vec<u8>, t: ObjectType, v: PointValue) {
     if t.is_analog() {
         app_real(
@@ -297,10 +412,10 @@ pub fn encode_value(buf: &mut Vec<u8>, t: ObjectType, v: PointValue) {
                 v.as_f64() as f32
             },
         );
-    } else if t.is_binary() {
-        app_enumerated(buf, v.as_bool() as u32);
-    } else {
+    } else if t.is_multistate() {
         app_unsigned(buf, v.as_u32() as u64);
+    } else {
+        app_enumerated(buf, v.as_bool() as u32);
     }
 }
 
@@ -312,7 +427,7 @@ fn read_object(o: &BacObject, property: u32, buf: &mut Vec<u8>) {
         PRESENT_VALUE => encode_value(buf, o.object_type, o.effective()),
         DESCRIPTION => app_char_string(buf, &o.description),
         STATUS_FLAGS => app_bit_string(buf, &o.status_flags()),
-        EVENT_STATE => app_enumerated(buf, 0), // normal
+        EVENT_STATE => app_enumerated(buf, o.event_state().bacnet_id()),
         OUT_OF_SERVICE => app_bool(buf, o.out_of_service),
         RELIABILITY => app_enumerated(buf, o.reliability.bacnet_id()),
         UNITS => app_enumerated(buf, o.units.bacnet_id()),
@@ -328,7 +443,14 @@ fn read_object(o: &BacObject, property: u32, buf: &mut Vec<u8>) {
             Some(p) => app_unsigned(buf, p as u64),
             None => app_null(buf),
         },
-        _ => unreachable!("property {property} listed but not encoded"),
+        _ => {
+            if !schedule::read(o, property, buf)
+                && !trend::read(o, property, buf)
+                && !alarm::read(o, property, buf)
+            {
+                unreachable!("property {property} listed but not encoded")
+            }
+        }
     }
 }
 
@@ -366,8 +488,9 @@ fn read_device(db: &PointDb, d: &BacDevice, property: u32, buf: &mut Vec<u8>) {
         NUMBER_OF_APDU_RETRIES => app_unsigned(buf, 3),
         DEVICE_ADDRESS_BINDING => {} // an empty list
         DATABASE_REVISION => app_unsigned(buf, d.database_revision as u64),
-        LOCAL_DATE => app_date(buf, clock::now().date()),
-        LOCAL_TIME => app_time(buf, clock::now().time()),
+        // The sim's clock once it runs, the host's before.
+        LOCAL_DATE => app_date(buf, clock::device_time(db.now).date()),
+        LOCAL_TIME => app_time(buf, clock::device_time(db.now).time()),
         UTC_OFFSET => app_signed(buf, clock::now().utc_offset as i64),
         DAYLIGHT_SAVINGS_STATUS => app_bool(buf, clock::now().dst),
         _ => unreachable!("property {property} listed but not encoded"),
@@ -378,6 +501,7 @@ fn read_device(db: &PointDb, d: &BacDevice, property: u32, buf: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use bask_points::Units;
+    use chrono::{NaiveDate, NaiveTime};
 
     fn device() -> (PointDb, BacDevice) {
         let mut db = PointDb::new(2001);
@@ -397,12 +521,16 @@ mod tests {
             PointValue::Multi(1),
         );
         msv.states = vec!["Occ".into(), "Unocc".into()];
-        let bi = bask_points::BacObject::new(
+        let mut bi = bask_points::BacObject::new(
             ObjectType::BinaryInput,
             3,
             "FAN-S",
             PointValue::Binary(true),
         );
+        bi.enable_change_of_state(false, 1, 30);
+        let mut ai =
+            bask_points::BacObject::new(ObjectType::AnalogInput, 4, "ZN-T", PointValue::Real(71.0));
+        ai.enable_out_of_range(60.0, 80.0, 1.0, 1, 30);
         let d = BacDevice {
             instance: 10,
             name: "VAV-1".into(),
@@ -411,7 +539,21 @@ mod tests {
             model_name: "Sim".into(),
             mac: Some(1),
             online: true,
-            objects: vec![av, msv, bi],
+            objects: vec![
+                av,
+                msv,
+                bi,
+                ai,
+                BacObject::schedule(
+                    1,
+                    "SCHED",
+                    std::array::from_fn(|_| {
+                        vec![(NaiveTime::from_hms_opt(7, 0, 0).unwrap(), true)]
+                    }),
+                ),
+                BacObject::trend_log(1, "TL", (ObjectType::AnalogInput, 4), 60, 10),
+                BacObject::notification_class(1, "NC"),
+            ],
             database_revision: 1,
         };
         db.devices.push(d.clone());
@@ -432,16 +574,24 @@ mod tests {
     #[test]
     fn every_listed_property_reads() {
         let (db, d) = device();
-        for t in [
-            Target::Device,
-            Target::Object(0),
-            Target::Object(1),
-            Target::Object(2),
-        ] {
+        // Lists that start out empty.
+        let empty = [
+            DEVICE_ADDRESS_BINDING,
+            LIST_OF_OBJECT_PROPERTY_REFERENCES,
+            EXCEPTION_SCHEDULE,
+        ];
+        for t in std::iter::once(Target::Device).chain((0..d.objects.len()).map(Target::Object)) {
             let (req, opt) = properties(&d, t);
             for p in req.into_iter().chain(opt) {
+                if p == LOG_BUFFER {
+                    assert_eq!(
+                        value(&db, &d, t, p, None),
+                        Err(BacError::READ_ACCESS_DENIED)
+                    );
+                    continue;
+                }
                 let v = value(&db, &d, t, p, None).unwrap();
-                assert!(!v.is_empty() || p == DEVICE_ADDRESS_BINDING, "{t:?} {p}");
+                assert!(!v.is_empty() || empty.contains(&p), "{t:?} {p}");
             }
         }
     }
@@ -480,7 +630,7 @@ mod tests {
         );
         assert_eq!(
             value(&db, &d, Target::Device, OBJECT_LIST, Some(0)).unwrap(),
-            [0x21, 4]
+            [0x21, 8]
         );
         assert_eq!(
             value(&db, &d, Target::Device, OBJECT_LIST, Some(1)).unwrap(),
@@ -490,7 +640,7 @@ mod tests {
             value(&db, &d, Target::Device, OBJECT_LIST, None)
                 .unwrap()
                 .len(),
-            4 * 5
+            8 * 5
         );
         // property-list leaves out object-identifier, -name, -type and itself
         let list = property_list(&d, av);
@@ -500,6 +650,59 @@ mod tests {
                 && !list.contains(&OBJECT_NAME)
         );
         assert!(!list.contains(&MAX_PRES_VALUE) && !list.contains(&PROPERTY_LIST));
+
+        // The new arrays: one day of the week, event time stamps unset.
+        let sched = Target::Object(4);
+        assert_eq!(
+            value(&db, &d, sched, WEEKLY_SCHEDULE, Some(0)).unwrap(),
+            [0x21, 7]
+        );
+        assert_eq!(
+            value(&db, &d, sched, WEEKLY_SCHEDULE, Some(3)).unwrap(),
+            [0x0E, 0xB4, 7, 0, 0, 0, 0x91, 1, 0x0F]
+        );
+        assert_eq!(
+            value(&db, &d, sched, EXCEPTION_SCHEDULE, Some(0)).unwrap(),
+            [0x21, 0]
+        );
+        assert_eq!(
+            value(&db, &d, Target::Object(3), EVENT_TIME_STAMPS, Some(1)).unwrap(),
+            [
+                0x2E, 0xA4, 255, 255, 255, 255, 0xB4, 255, 255, 255, 255, 0x2F
+            ]
+        );
+        assert_eq!(
+            value(&db, &d, Target::Object(6), PRIORITY, None).unwrap(),
+            [0x21, 100, 0x21, 100, 0x21, 200]
+        );
+    }
+
+    #[test]
+    fn alarm_properties_only_with_reporting() {
+        let (_, d) = device();
+        assert!(!has_property(&d, Target::Object(0), EVENT_ENABLE));
+        assert!(has_property(&d, Target::Object(2), ALARM_VALUE));
+        assert!(!has_property(&d, Target::Object(2), HIGH_LIMIT));
+        assert!(has_property(&d, Target::Object(3), HIGH_LIMIT));
+        assert!(has_property(&d, Target::Object(3), EVENT_TIME_STAMPS));
+        assert!(!has_property(&d, Target::Object(5), PRESENT_VALUE));
+        assert!(!has_property(&d, Target::Object(6), STATUS_FLAGS));
+    }
+
+    #[test]
+    fn local_time_follows_the_sim() {
+        let (mut db, d) = device();
+        db.now = NaiveDate::from_ymd_opt(2026, 7, 4)
+            .unwrap()
+            .and_hms_opt(13, 30, 5);
+        assert_eq!(
+            value(&db, &d, Target::Device, LOCAL_DATE, None).unwrap(),
+            [0xA4, 126, 7, 4, 6]
+        );
+        assert_eq!(
+            value(&db, &d, Target::Device, LOCAL_TIME, None).unwrap(),
+            [0xB4, 13, 30, 5, 0]
+        );
     }
 
     #[test]
@@ -523,6 +726,7 @@ mod tests {
             resolve(&d, ObjectId::new(10, 1)),
             Err(BacError::UNKNOWN_OBJECT)
         );
+        assert_eq!(resolve(&d, ObjectId::new(17, 1)), Ok(Target::Object(4)));
     }
 
     #[test]
@@ -532,9 +736,22 @@ mod tests {
         // 41 bits: 6 octets, 7 unused
         assert_eq!(&v[..3], [0x85, 0x07, 7]);
         let bit = |n: usize| v[3 + n / 8] & (0x80 >> (n % 8)) != 0;
-        for n in [5, 12, 14, 15, 16, 26, 27, 33, 34] {
+        for n in [0, 2, 5, 12, 14, 15, 16, 26, 27, 29, 33, 34, 35, 39] {
             assert!(bit(n), "service bit {n}");
         }
-        assert!(!bit(0) && !bit(6) && !bit(32));
+        assert!(!bit(3) && !bit(6) && !bit(32) && !bit(36));
+        let v = value(
+            &db,
+            &d,
+            Target::Device,
+            PROTOCOL_OBJECT_TYPES_SUPPORTED,
+            None,
+        )
+        .unwrap();
+        let bit = |n: usize| v[3 + n / 8] & (0x80 >> (n % 8)) != 0;
+        for n in [0, 1, 2, 3, 4, 5, 8, 13, 14, 15, 17, 19, 20] {
+            assert!(bit(n), "object type bit {n}");
+        }
+        assert!(!bit(6) && !bit(10));
     }
 }

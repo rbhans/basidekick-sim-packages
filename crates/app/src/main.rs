@@ -9,6 +9,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod brand;
+mod chart;
 mod ui;
 
 use gpui_kit::{
@@ -92,7 +93,7 @@ fn main() {
     {
         if args.iter().any(|a| a == "--help" || a == "-h") {
             println!(
-                "basidekick-sim [--package <id>] [--start]   open the app (on a building, started)\n"
+                "basidekick-sim [--package <id>] [--start] [--lesson <id>]   open the app (on a building, started, set up for a lesson)\n"
             );
             print!("{}", bask_runner::cli::usage());
             return;
@@ -112,6 +113,11 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let start = args.iter().any(|a| a == "--start");
+    let lesson = args
+        .iter()
+        .position(|a| a == "--lesson")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     gpui_kit::application()
         .with_assets(AppAssets)
         .run(move |cx: &mut App| {
@@ -147,7 +153,11 @@ fn main() {
                     ..Default::default()
                 },
                 cx,
-                |window, cx| cx.new(|cx| ui::SimApp::new(package.as_deref(), start, window, cx)),
+                |window, cx| {
+                    cx.new(|cx| {
+                        ui::SimApp::new(package.as_deref(), start, lesson.clone(), window, cx)
+                    })
+                },
             )
             .unwrap();
             cx.activate(true);

@@ -4,7 +4,9 @@ use crate::encoding::{app_enumerated, close, open};
 
 /// Confirmed service choices.
 pub mod confirmed {
+    pub const ACKNOWLEDGE_ALARM: u8 = 0;
     pub const COV_NOTIFICATION: u8 = 1;
+    pub const EVENT_NOTIFICATION: u8 = 2;
     pub const SUBSCRIBE_COV: u8 = 5;
     pub const READ_PROPERTY: u8 = 12;
     pub const READ_PROPERTY_MULTIPLE: u8 = 14;
@@ -12,6 +14,8 @@ pub mod confirmed {
     pub const WRITE_PROPERTY_MULTIPLE: u8 = 16;
     pub const DEVICE_COMMUNICATION_CONTROL: u8 = 17;
     pub const REINITIALIZE_DEVICE: u8 = 20;
+    pub const READ_RANGE: u8 = 26;
+    pub const GET_EVENT_INFORMATION: u8 = 29;
 }
 
 /// Unconfirmed service choices.
@@ -19,10 +23,12 @@ pub mod unconfirmed {
     pub const I_AM: u8 = 0;
     pub const I_HAVE: u8 = 1;
     pub const COV_NOTIFICATION: u8 = 2;
+    pub const EVENT_NOTIFICATION: u8 = 3;
     pub const WHO_HAS: u8 = 7;
     pub const WHO_IS: u8 = 8;
 }
 
+pub const REJECT_PARAMETER_OUT_OF_RANGE: u8 = 6;
 pub const REJECT_UNRECOGNIZED_SERVICE: u8 = 9;
 pub const ABORT_SEGMENTATION_NOT_SUPPORTED: u8 = 4;
 
@@ -43,16 +49,22 @@ impl BacError {
     }
 
     pub const UNKNOWN_OBJECT: Self = Self::new(1, 31);
+    /// AcknowledgeAlarm on an object that doesn't report events.
+    pub const NO_ALARM_CONFIGURED: Self = Self::new(1, 74);
     /// SubscribeCOV on an object that doesn't report changes (the device).
     pub const OPTIONAL_FUNCTIONALITY_NOT_SUPPORTED: Self = Self::new(1, 45);
     pub const INVALID_DATA_TYPE: Self = Self::new(2, 9);
     pub const READ_ACCESS_DENIED: Self = Self::new(2, 27);
+    pub const PROPERTY_IS_NOT_A_LIST: Self = Self::new(2, 22);
     pub const UNKNOWN_PROPERTY: Self = Self::new(2, 32);
     pub const VALUE_OUT_OF_RANGE: Self = Self::new(2, 37);
     pub const WRITE_ACCESS_DENIED: Self = Self::new(2, 40);
     pub const INVALID_ARRAY_INDEX: Self = Self::new(2, 42);
     pub const NOT_AN_ARRAY: Self = Self::new(2, 50);
     pub const NO_SPACE: Self = Self::new(3, 19);
+    pub const NO_SPACE_TO_WRITE: Self = Self::new(3, 20);
+    /// AcknowledgeAlarm quoting a time stamp that isn't the transition's.
+    pub const INVALID_TIME_STAMP: Self = Self::new(5, 14);
 
     pub fn encode(self, buf: &mut Vec<u8>) {
         app_enumerated(buf, self.class);
@@ -74,8 +86,8 @@ pub struct ConfirmedHeader {
 pub enum Apdu<'a> {
     Confirmed(ConfirmedHeader, &'a [u8]),
     Unconfirmed(u8, &'a [u8]),
-    /// Acks, errors, rejects and aborts: answers to our own confirmed COV
-    /// notifications, which we don't track.
+    /// Acks, errors, rejects and aborts: answers to our own confirmed COV and
+    /// event notifications, which we don't track.
     Other,
 }
 
@@ -158,8 +170,8 @@ pub fn unconfirmed_request(service: u8, body: &[u8]) -> Vec<u8> {
     v
 }
 
-/// A confirmed request from us (COV notifications): unsegmented, and we
-/// accept replies up to 1476 bytes.
+/// A confirmed request from us (COV and event notifications): unsegmented,
+/// and we accept replies up to 1476 bytes.
 pub fn confirmed_request(invoke_id: u8, service: u8, body: &[u8]) -> Vec<u8> {
     let mut v = vec![0x00, 0x05, invoke_id, service];
     v.extend_from_slice(body);

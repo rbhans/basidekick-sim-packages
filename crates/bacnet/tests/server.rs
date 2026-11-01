@@ -5,6 +5,7 @@
 
 use bask_bacnet::{BacnetServer, ServerConfig, ServerEvent};
 use bask_points::{BacDevice, BacObject, ObjectType, PointDb, PointValue, SharedDb, Units};
+use chrono::{Duration as SimDuration, NaiveDate, NaiveDateTime, NaiveTime};
 use parking_lot::Mutex;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -19,11 +20,23 @@ const AHU: u32 = 1002;
 const AI: u16 = 0;
 const AO: u16 = 1;
 const AV: u16 = 2;
-const MSV: u16 = 19;
+const BI: u16 = 3;
 const DEVICE: u16 = 8;
+const NC: u16 = 15;
+const SCH: u16 = 17;
+const MSV: u16 = 19;
+const TL: u16 = 20;
 
+const EXCEPTION_SCHEDULE: u32 = 38;
+const LOCAL_DATE: u32 = 56;
+const OUT_OF_SERVICE: u32 = 81;
 const PRESENT_VALUE: u32 = 85;
 const PRIORITY_ARRAY: u32 = 87;
+const RECIPIENT_LIST: u32 = 102;
+const WEEKLY_SCHEDULE: u32 = 123;
+const LOG_BUFFER: u32 = 131;
+const RECORD_COUNT: u32 = 141;
+const DATABASE_REVISION: u32 = 155;
 const CURRENT_COMMAND_PRIORITY: u32 = 431;
 
 fn building() -> SharedDb {
@@ -64,19 +77,42 @@ fn building() -> SharedDb {
     occ.commandable = true;
     occ.states = vec!["Auto".into(), "Occupied".into(), "Unoccupied".into()];
 
-    let sa_t = BacObject::new(ObjectType::AnalogInput, 1, "SA-T", PointValue::Real(55.0));
+    let mut sa_t = BacObject::new(ObjectType::AnalogInput, 1, "SA-T", PointValue::Real(55.0));
+    sa_t.units = Units::DegreesFahrenheit;
     let sf_c = BacObject::new(
         ObjectType::BinaryOutput,
         1,
         "SF-C",
         PointValue::Binary(true),
     );
+    let mut sf_fail = BacObject::new(
+        ObjectType::BinaryInput,
+        1,
+        "SF-FAIL",
+        PointValue::Binary(false),
+    );
+    sf_fail.enable_change_of_state(true, 1, 0);
+    let hm = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+    let day = vec![(hm(7, 0), true), (hm(17, 0), false)];
+    let weekly = std::array::from_fn(|d| if d < 5 { day.clone() } else { vec![] });
 
     let mut db = PointDb::new(NET);
     db.devices = vec![
         device(SITE, "SITE", None, vec![oat]),
         device(VAV, "VAV-1", Some(1), vec![zn_t, zn_sp, dmpr, occ]),
-        device(AHU, "AHU-1", Some(2), vec![sa_t, sf_c]),
+        device(
+            AHU,
+            "AHU-1",
+            Some(2),
+            vec![
+                sa_t,
+                sf_c,
+                sf_fail,
+                BacObject::schedule(1, "OCC-SCHED", weekly),
+                BacObject::trend_log(1, "SA-T-TL", (ObjectType::AnalogInput, 1), 60, 500),
+                BacObject::notification_class(1, "ALARMS"),
+            ],
+        ),
     ];
     Arc::new(Mutex::new(db))
 }
@@ -262,8 +298,23 @@ impl Client {
         value: &[u8],
         priority: Option<u8>,
     ) -> Packet {
+        self.write_at(mac, object, property, None, value, priority)
+    }
+
+    fn write_at(
+        &mut self,
+        mac: Option<u8>,
+        object: (u16, u32),
+        property: u32,
+        index: Option<u8>,
+        value: &[u8],
+        priority: Option<u8>,
+    ) -> Packet {
         let mut body = ctx_oid(0, object);
         body.extend(ctx_enum(1, property));
+        if let Some(i) = index {
+            body.extend([0x29, i]);
+        }
         body.push(0x3E);
         body.extend_from_slice(value);
         body.push(0x3F);
@@ -703,10 +754,14 @@ fn errors() {
         (1, 31)
     );
 
-    // Unrecognized service (ReadRange) → Reject 9; malformed → Reject 5.
+    // Unrecognized service (AtomicReadFile) → Reject 9; malformed → Reject 5.
+    assert_eq!(
+        c.request(None, 6, &ctx_oid(0, (AI, 1))).payload,
+        [0x60, c.invoke, 9]
+    );
     assert_eq!(
         c.request(None, 26, &ctx_oid(0, (AI, 1))).payload,
-        [0x60, c.invoke, 9]
+        [0x60, c.invoke, 5]
     );
     assert_eq!(
         c.request(None, 12, &ctx_oid(0, (AI, 1))).payload,
@@ -815,4 +870,458 @@ fn cov_subscription_notifies_changes() {
     assert_eq!(c.request(Some(1), 5, &cancel).payload, [0x20, c.invoke, 5]);
     c.db.lock().devices[1].objects[0].present_value = PointValue::Real(80.0);
     assert!(c.recv_for(Duration::from_millis(500)).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Schedules, trend logs and alarms (all on AHU-1, MAC 2)
+
+/// 2026-11-02 is a Monday.
+fn monday(h: u32, m: u32) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 11, 2)
+        .unwrap()
+        .and_hms_opt(h, m, 0)
+        .unwrap()
+}
+
+fn ack(c: &Client, p: &Packet) {
+    assert_eq!(p.payload, [0x20, c.invoke, 15], "not a SimpleAck");
+}
+
+/// A write to AHU-1 that has to take.
+fn write_ok(c: &mut Client, object: (u16, u32), property: u32, value: &[u8]) {
+    let reply = c.write(Some(2), object, property, value, None);
+    ack(c, &reply);
+}
+
+#[test]
+fn schedule_reads_and_writes() {
+    let mut c = start();
+    c.db.lock().tick(monday(8, 0));
+    let sched = (SCH, 1);
+    assert_eq!(
+        c.read_value(Some(2), sched, PRESENT_VALUE, None),
+        [T::App(9, vec![1])]
+    );
+    assert_eq!(
+        as_unsigned(&c.read_value(Some(2), sched, WEEKLY_SCHEDULE, Some(0))[0]),
+        7
+    );
+    assert_eq!(
+        c.read_value(Some(2), sched, WEEKLY_SCHEDULE, Some(1)),
+        [
+            T::Open(0),
+            T::App(11, vec![7, 0, 0, 0]),
+            T::App(9, vec![1]),
+            T::App(11, vec![17, 0, 0, 0]),
+            T::App(9, vec![0]),
+            T::Close(0)
+        ]
+    );
+    assert_eq!(
+        c.read_value(Some(2), sched, WEEKLY_SCHEDULE, None)
+            .iter()
+            .filter(|t| **t == T::Open(0))
+            .count(),
+        7
+    );
+    // The device's clock is the sim's.
+    assert_eq!(
+        c.read_value(Some(2), (DEVICE, AHU), LOCAL_DATE, None),
+        [T::App(10, vec![126, 11, 2, 1])]
+    );
+    let revision = as_unsigned(&c.read_value(Some(2), (DEVICE, AHU), DATABASE_REVISION, None)[0]);
+
+    // Mondays become 06:30–18:00.
+    let mon = [
+        0x0E, 0xB4, 6, 30, 0, 0, 0x91, 1, 0xB4, 18, 0, 0, 0, 0x91, 0, 0x0F,
+    ];
+    let reply = c.write_at(Some(2), sched, WEEKLY_SCHEDULE, Some(1), &mon, None);
+    ack(&c, &reply);
+    let back: Vec<u8> = c
+        .read(Some(2), sched, WEEKLY_SCHEDULE, Some(1))
+        .payload
+        .to_vec();
+    assert!(back.windows(mon.len()).any(|w| w == mon));
+    assert_eq!(
+        as_unsigned(&c.read_value(Some(2), (DEVICE, AHU), DATABASE_REVISION, None)[0]),
+        revision + 1
+    );
+    // Not a BinaryPV; the size of a fixed array.
+    let two = [0x0E, 0xB4, 6, 30, 0, 0, 0x91, 2, 0x0F];
+    assert_eq!(
+        error_of(&c.write_at(Some(2), sched, WEEKLY_SCHEDULE, Some(2), &two, None)),
+        (2, 37)
+    );
+    assert_eq!(
+        error_of(&c.write_at(Some(2), sched, WEEKLY_SCHEDULE, Some(0), &[0x21, 6], None)),
+        (2, 40)
+    );
+
+    // In service the schedule owns its present value; out of service, we do.
+    assert_eq!(
+        error_of(&c.write(Some(2), sched, PRESENT_VALUE, &[0x91, 0], None)),
+        (2, 40)
+    );
+    write_ok(&mut c, sched, OUT_OF_SERVICE, &[0x11]);
+    write_ok(&mut c, sched, PRESENT_VALUE, &[0x91, 0]);
+    assert_eq!(
+        c.read_value(Some(2), sched, PRESENT_VALUE, None),
+        [T::App(9, vec![0])]
+    );
+    write_ok(&mut c, sched, OUT_OF_SERVICE, &[0x10]);
+    assert_eq!(
+        c.read_value(Some(2), sched, PRESENT_VALUE, None),
+        [T::App(9, vec![1])]
+    );
+
+    // A holiday today, off from midnight: it takes effect at once.
+    let holiday = [
+        0x0E, 0x0C, 126, 11, 2, 255, 0x0F, 0x2E, 0xB4, 0, 0, 0, 0, 0x91, 0, 0x2F, 0x39, 10,
+    ];
+    write_ok(&mut c, sched, EXCEPTION_SCHEDULE, &holiday);
+    assert_eq!(
+        c.read_value(Some(2), sched, PRESENT_VALUE, None),
+        [T::App(9, vec![0])]
+    );
+    assert_eq!(
+        as_unsigned(&c.read_value(Some(2), sched, EXCEPTION_SCHEDULE, Some(0))[0]),
+        1
+    );
+    // A calendar reference is refused.
+    let calendar = [0x1C, 0x01, 0x80, 0x00, 0x01, 0x2E, 0x2F, 0x39, 10];
+    assert_eq!(
+        error_of(&c.write(Some(2), sched, EXCEPTION_SCHEDULE, &calendar, None)),
+        (2, 37)
+    );
+    let writes: Vec<String> = c
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            ServerEvent::Write { object, text, .. } => Some(format!("{object}: {text}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes[0],
+        "OCC-SCHED: weekly-schedule[1] = 06:30 on, 18:00 off"
+    );
+}
+
+/// A ReadRange-ACK: (first-item, last-item, more-items), item count, the
+/// records' REAL values, first sequence number.
+type RangeAck = ([bool; 3], u64, Vec<f32>, Option<u64>);
+
+fn read_range(c: &mut Client, max_apdu: u8, range: &[u8]) -> RangeAck {
+    let mut body = ctx_oid(0, (TL, 1));
+    body.extend(ctx_enum(1, LOG_BUFFER));
+    body.extend_from_slice(range);
+    let reply = c.request_with(Some(2), max_apdu, 26, &body).unwrap();
+    assert_eq!(
+        &reply.payload[..3],
+        [0x30, c.invoke, 26],
+        "{:02X?}",
+        reply.payload
+    );
+    let t = tags(&reply.payload[3..]);
+    let T::Ctx(3, flags) = &t[2] else { panic!() };
+    let flags = [0, 1, 2].map(|i| flags[1] & (0x80 >> i) != 0);
+    let T::Ctx(4, count) = &t[3] else { panic!() };
+    let count = count.iter().fold(0, |acc, &b| acc << 8 | b as u64);
+    assert_eq!(t[4], T::Open(5));
+    let close = t.iter().position(|x| *x == T::Close(5)).unwrap();
+    let values: Vec<f32> = t[5..close]
+        .windows(2)
+        .filter_map(|w| match w {
+            [T::Open(1), T::Ctx(2, v)] => Some(f32::from_be_bytes(v[..].try_into().unwrap())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values.len() as u64, count);
+    let first = t.get(close + 1).map(|x| match x {
+        T::Ctx(6, s) => s.iter().fold(0, |acc, &b| acc << 8 | b as u64),
+        other => panic!("{other:?}"),
+    });
+    (flags, count, values, first)
+}
+
+/// A range's brackets around an Unsigned (or a date and time) and an INTEGER.
+fn range(tag: u8, reference: &[u8], count: i8) -> Vec<u8> {
+    let mut b = vec![tag << 4 | 0x0E];
+    b.extend_from_slice(reference);
+    b.extend([0x31, count as u8, tag << 4 | 0x0F]);
+    b
+}
+
+#[test]
+fn trend_log_read_range() {
+    let mut c = start();
+    {
+        // An hour and forty minutes of one-minute samples: 0, 1, 2 …
+        let mut db = c.db.lock();
+        for m in 0..100 {
+            db.devices[2].objects[0].present_value = PointValue::Real(m as f32);
+            db.tick(monday(6, 0) + SimDuration::minutes(m));
+        }
+    }
+    let tl = (TL, 1);
+    assert_eq!(error_of(&c.read(Some(2), tl, LOG_BUFFER, None)), (2, 27));
+    assert_eq!(
+        as_unsigned(&c.read_value(Some(2), tl, RECORD_COUNT, None)[0]),
+        100
+    );
+
+    // Everything, for a client that takes 480 bytes: as many as fit.
+    let (flags, count, values, first) = read_range(&mut c, 0x03, &[]);
+    assert_eq!(flags, [true, false, true]);
+    assert!((10..30).contains(&count), "{count}");
+    assert_eq!(values[..3], [0.0, 1.0, 2.0]);
+    assert_eq!(first, None);
+    // The rest in pages, by position.
+    let mut got = values.len();
+    while got < 100 {
+        let reference = [0x21, got as u8 + 1];
+        let (flags, _, values, _) = read_range(&mut c, 0x03, &range(3, &reference, 127));
+        assert_eq!(values[0], got as f32);
+        got += values.len();
+        assert_eq!(flags[2], got < 100);
+        assert_eq!(flags[1], got == 100);
+    }
+
+    // Counting back from the newest.
+    assert_eq!(
+        read_range(&mut c, 0x05, &range(3, &[0x21, 100], -3)),
+        ([false, true, false], 3, vec![97.0, 98.0, 99.0], None)
+    );
+    // By sequence number, both ways.
+    assert_eq!(
+        read_range(&mut c, 0x05, &range(6, &[0x21, 50], 2)),
+        ([false, false, false], 2, vec![49.0, 50.0], Some(50))
+    );
+    assert_eq!(
+        read_range(&mut c, 0x05, &range(6, &[0x21, 3], -5)),
+        ([true, false, false], 3, vec![0.0, 1.0, 2.0], Some(1))
+    );
+    // By time: newer than 07:00, and the two before 06:30.
+    let at = |h, m| [0xA4, 126, 11, 2, 1, 0xB4, h, m, 0, 0];
+    assert_eq!(
+        read_range(&mut c, 0x05, &range(7, &at(7, 0), 2)),
+        ([false, false, false], 2, vec![61.0, 62.0], Some(62))
+    );
+    assert_eq!(
+        read_range(&mut c, 0x05, &range(7, &at(6, 30), -2)),
+        ([false, false, false], 2, vec![28.0, 29.0], Some(29))
+    );
+    // Not a list.
+    let mut body = ctx_oid(0, tl);
+    body.extend(ctx_enum(1, RECORD_COUNT));
+    assert_eq!(error_of(&c.request(Some(2), 26, &body)), (2, 22));
+}
+
+/// The parts of an event notification a test looks at.
+#[derive(Debug, PartialEq)]
+struct Event {
+    process: u64,
+    object: (u16, u32),
+    date: Vec<u8>,
+    time: Vec<u8>,
+    event_type: u8,
+    notify_type: u8,
+    to_state: u8,
+    text: String,
+}
+
+fn event(p: &Packet) -> Event {
+    let body = match p.payload[0] {
+        0x10 => {
+            assert_eq!(p.payload[1], 3, "not an UnconfirmedEventNotification");
+            &p.payload[2..]
+        }
+        0x00 => {
+            assert_eq!(p.payload[3], 2, "not a ConfirmedEventNotification");
+            &p.payload[4..]
+        }
+        _ => panic!("{:02X?}", p.payload),
+    };
+    let t = tags(body);
+    let ctx = |n: u8| -> &Vec<u8> {
+        t.iter()
+            .find_map(|x| match x {
+                T::Ctx(m, c) if *m == n => Some(c),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no context tag {n}"))
+    };
+    let T::App(10, date) = &t[5] else { panic!() };
+    let T::App(11, time) = &t[6] else { panic!() };
+    assert_eq!(instance_of(&t[1]), (DEVICE, AHU));
+    Event {
+        process: ctx(0).iter().fold(0, |acc, &b| acc << 8 | b as u64),
+        object: instance_of(&t[2]),
+        date: date.clone(),
+        time: time.clone(),
+        event_type: ctx(6)[0],
+        notify_type: ctx(8)[0],
+        to_state: ctx(11)[0],
+        text: String::from_utf8(ctx(7)[1..].to_vec()).unwrap(),
+    }
+}
+
+/// A Recipient_List with one destination: every day and time, every
+/// transition, and `recipient` already encoded.
+fn recipient_list(recipient: &[u8], process: u8, confirmed: bool) -> Vec<u8> {
+    let mut b = vec![0x82, 0x01, 0xFE, 0xB4, 0, 0, 0, 0, 0xB4, 23, 59, 59, 99];
+    b.extend_from_slice(recipient);
+    b.extend([0x21, process, 0x10 | confirmed as u8, 0x82, 0x05, 0xE0]);
+    b
+}
+
+fn acknowledge_alarm(object: (u16, u32), state: u8, date: &[u8], time: &[u8]) -> Vec<u8> {
+    let mut b = vec![0x09, 1];
+    b.extend(ctx_oid(1, object));
+    b.extend([0x29, state, 0x3E, 0x2E, 0xA4]);
+    b.extend_from_slice(date);
+    b.push(0xB4);
+    b.extend_from_slice(time);
+    b.extend([0x2F, 0x3F, 0x4D, 5, 0, b'T', b'e', b'c', b'h', 0x5E, 0x2E]);
+    b.extend([0xA4, 126, 11, 2, 1, 0xB4, 9, 0, 0, 0, 0x2F, 0x5F]);
+    b
+}
+
+/// The object ids in a GetEventInformation-ACK, and more-events.
+fn event_information(c: &mut Client) -> (Vec<(u16, u32)>, bool) {
+    let reply = c.request(Some(2), 29, &[]);
+    assert_eq!(&reply.payload[..3], [0x30, c.invoke, 29]);
+    let t = tags(&reply.payload[3..]);
+    let ids = t
+        .windows(2)
+        .filter_map(|w| match w {
+            [T::Ctx(0, id), T::Ctx(1, _)] => Some(instance_of(&T::Ctx(0, id.clone()))),
+            _ => None,
+        })
+        .collect();
+    (ids, t[t.len() - 1] == T::Ctx(1, vec![1]))
+}
+
+#[test]
+fn alarms_notify_and_take_acknowledgments() {
+    let mut c = start();
+    let SocketAddr::V4(me) = c.sock.local_addr().unwrap() else {
+        panic!()
+    };
+    // Point the notification class at our own address.
+    let mut address = vec![0x1E, 0x21, 0x00, 0x65, 0x06];
+    address.extend(me.ip().octets());
+    address.extend(me.port().to_be_bytes());
+    address.push(0x1F);
+    let list = recipient_list(&address, 7, false);
+    write_ok(&mut c, (NC, 1), RECIPIENT_LIST, &list);
+    let back = c.read_value(Some(2), (NC, 1), RECIPIENT_LIST, None);
+    assert_eq!(back[3], T::Open(1));
+    assert_eq!(event_information(&mut c), (vec![], false));
+
+    // The supply fan fails.
+    {
+        let mut db = c.db.lock();
+        db.tick(monday(9, 0));
+        db.devices[2].objects[2].present_value = PointValue::Binary(true);
+        db.tick(monday(9, 0) + SimDuration::seconds(1));
+    }
+    let p = c.recv().expect("event notification");
+    assert_eq!(p.snet, Some((NET, vec![2])));
+    let alarm = event(&p);
+    assert_eq!(
+        (
+            alarm.process,
+            alarm.object,
+            alarm.event_type,
+            alarm.notify_type,
+            alarm.to_state
+        ),
+        (7, (BI, 1), 1, 0, 2)
+    );
+    assert_eq!(alarm.text, "SF-FAIL alarm: On");
+    assert_eq!(alarm.time, [9, 0, 1, 0]);
+    // It shows as in alarm, unacknowledged.
+    assert_eq!(
+        c.read_value(Some(2), (BI, 1), 36, None),
+        [T::App(9, vec![2])]
+    );
+    assert_eq!(
+        c.read_value(Some(2), (BI, 1), 0, None),
+        [T::App(8, vec![5, 0x60])]
+    );
+    assert_eq!(event_information(&mut c), (vec![(BI, 1)], false));
+
+    // The wrong time stamp, then the right one.
+    let wrong = acknowledge_alarm((BI, 1), 2, &alarm.date, &[9, 0, 0, 0]);
+    assert_eq!(error_of(&c.request(Some(2), 0, &wrong)), (5, 14));
+    let right = acknowledge_alarm((BI, 1), 2, &alarm.date, &alarm.time);
+    assert_eq!(c.request(Some(2), 0, &right).payload, [0x20, c.invoke, 0]);
+    let acked = event(&c.recv().expect("ack notification"));
+    assert_eq!(
+        (acked.notify_type, acked.to_state, acked.time),
+        (2, 2, alarm.time)
+    );
+    assert!(c.events().iter().any(|e| matches!(
+        e,
+        ServerEvent::Acknowledged { device, object, .. } if device == "AHU-1" && object == "SF-FAIL"
+    )));
+    // Still in alarm, so still listed; back to normal, it drops off.
+    assert_eq!(event_information(&mut c), (vec![(BI, 1)], false));
+    {
+        let mut db = c.db.lock();
+        db.devices[2].objects[2].present_value = PointValue::Binary(false);
+        db.tick(monday(9, 5));
+    }
+    let normal = event(&c.recv().expect("to-normal notification"));
+    assert_eq!((normal.notify_type, normal.to_state), (0, 0));
+    assert_eq!(event_information(&mut c), (vec![], false));
+    assert_eq!(
+        c.read_value(Some(2), (BI, 1), 111, None),
+        [T::App(8, vec![4, 0x00])]
+    );
+}
+
+#[test]
+fn confirmed_notifications_to_a_device_recipient() {
+    let mut c = start();
+    // Device 9999, confirmed. Until it answers Who-Is, nothing is sent.
+    let list = recipient_list(&[0x0C, 0x02, 0x00, 0x27, 0x0F], 3, true);
+    write_ok(&mut c, (NC, 1), RECIPIENT_LIST, &list);
+    {
+        let mut db = c.db.lock();
+        db.tick(monday(9, 0));
+        db.devices[2].objects[2].present_value = PointValue::Binary(true);
+        db.tick(monday(9, 0) + SimDuration::seconds(1));
+    }
+    assert!(c.recv_for(Duration::from_millis(500)).is_empty());
+
+    // I-Am from device 9999 (us).
+    c.send(
+        None,
+        None,
+        None,
+        &[
+            0x10, 0x00, 0xC4, 0x02, 0x00, 0x27, 0x0F, 0x22, 0x05, 0xC4, 0x91, 0x03, 0x21, 0x0F,
+        ],
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    {
+        let mut db = c.db.lock();
+        db.devices[2].objects[2].present_value = PointValue::Binary(false);
+        db.tick(monday(9, 1));
+    }
+    let p = c.recv().expect("confirmed event notification");
+    let normal = event(&p);
+    assert_eq!((normal.process, normal.to_state), (3, 0));
+    // Answer it the way a front end would; the device takes it quietly.
+    let invoke = p.payload[2];
+    c.send(Some((NET, &[2])), None, None, &[0x20, invoke, 2]);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !c.events()
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Error(_)))
+    );
+    assert!(c.recv_for(Duration::from_millis(300)).is_empty());
 }

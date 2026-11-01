@@ -137,6 +137,14 @@ fn run(sim: Arc<Mutex<Simulation>>, events: mpsc::Receiver<ServerEvent>, stop: A
                     Level::Bacnet,
                     format!("{} subscribed to COV on {device} {object}", from.ip()),
                 ),
+                ServerEvent::Acknowledged {
+                    from,
+                    device,
+                    object,
+                } => (
+                    Level::Bacnet,
+                    format!("{} acknowledged the alarm on {device} {object}", from.ip()),
+                ),
                 ServerEvent::Error(e) => (Level::Alarm, format!("BACnet: {e}")),
             };
             sim.note(level, text);

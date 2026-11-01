@@ -161,3 +161,59 @@ category = "network"
 description = "RTU-3 stops answering BACnet for 30 minutes. It keeps running on its own logic."
 duration_min = 30
 effects = [{ kind = "offline", equip = "RTU-3" }]
+
+# Lessons: the Lessons tab sets each one up and walks through it.
+
+[[lesson]]
+id = "rtu-basics"
+title = "Read a rooftop unit"
+level = "Beginner"
+goal = "Learn what a packaged rooftop unit's points tell you on a normal summer morning."
+setup = { season = "summer", time = "10:00", speed = 1, device = "RTU-1", chart = "Zone temperature" }
+steps = [
+    "Discover devices from your BAS. The site controller, device 1000, routes to network 2001 where the four rooftop units live.",
+    "Open RTU-1. Compare `ZN-T` with `EFF-CLG-SP` and `EFF-HTG-SP`.",
+    "Read `CLG-DMD`, then the stage commands `CLG1-C` and `CLG2-C`, and `UNIT-MODE`.",
+    "Watch `SA-T` on the Air temperatures chart as a stage comes on and off.",
+]
+expect = "The cooling demand rises as the room warms past its setpoint, and the stages follow it. Supply air drops 15 to 20 °F within a few minutes of a stage starting and drifts back when it stops. The room rides within a degree of its cooling setpoint."
+
+[[lesson]]
+id = "short-cycling"
+title = "Short cycling"
+level = "Intermediate"
+goal = "See what the minimum on and off times protect a compressor from."
+setup = { season = "summer", time = "14:00", speed = 10, device = "RTU-3", chart = "Air temperatures" }
+steps = [
+    "RTU-3 is oversized for the conference room. Read `CMP-STARTS` (starts in the last hour).",
+    "Write `CMP-MIN-ON` = 0, `CMP-MIN-OFF` = 0 and `CLG-KP` = 200.",
+    "Watch an hour of sim time: `CLG1-C`, `SA-T` and `CMP-STARTS`.",
+    "Put them back to 180, 300 and 40.",
+]
+expect = "Runs shrink to about three minutes, supply air swings 20 to 30 °F, and starts climb from about 3 an hour toward 6. Every start is wear on the compressor. The timers trade a little temperature swing for a lot of compressor life."
+
+[[lesson]]
+id = "economizer-stuck"
+title = "Economizer stuck open"
+level = "Intermediate"
+goal = "Find a stuck damper from temperatures that don't add up."
+setup = { season = "winter", time = "10:00", speed = 10, scenarios = ["rtu1-damper-stuck"], device = "RTU-1", chart = "Air temperatures" }
+steps = [
+    "Read `OAD-O` on RTU-1. What position is the damper commanded to?",
+    "Now compare `MA-T` with `RA-T` and `OA-T`. Where would mixed air sit at that command?",
+    "Look at RTU-1's heating stages, its `SA-T` and its `ZN-T`, against RTU-2's.",
+]
+expect = "The command says minimum outside air, but mixed air sits right at the outdoor temperature: the damper is wide open whatever it's told. RTU-1 heats flat out and still loses ground, and the open office slides below its heating setpoint. The check is mixed air: it should sit between outdoor and return, in proportion to the damper command."
+
+[[lesson]]
+id = "dcv-rtu"
+title = "Ventilation on demand"
+level = "Beginner"
+goal = "See a rooftop unit's outside air follow the room's CO2."
+setup = { season = "mild", time = "07:30", speed = 10, device = "RTU-1", chart = "CO2" }
+steps = [
+    "Before people arrive, read `ZN-CO2`, `EFF-MIN-OA`, `AREA-MIN-OA` and `MIN-OA` on RTU-1.",
+    "Watch the morning: CO2 climbs as people arrive, and `EFF-MIN-OA` follows it up.",
+    "Write `DCV` = Disabled at priority 8 and watch `EFF-MIN-OA` jump to `MIN-OA`.",
+]
+expect = "With few people in, RTU-1 brings in only its empty-room minimum of outside air. As CO2 climbs past 600 ppm the minimum ramps up, reaching the full `MIN-OA` at 900 ppm (`CO2-SP`). With DCV off it takes the full minimum all day, and on a hot or cold day it pays to condition all that outside air."

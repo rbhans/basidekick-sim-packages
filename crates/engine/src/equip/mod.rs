@@ -126,6 +126,32 @@ impl Tuning {
     }
 }
 
+/// BTU/h to change one cfm of air by one lb/lb of humidity ratio.
+pub const LATENT_PER_CFM: f64 = 4840.0;
+
+/// A chilled water coil that has cooled air to `t_out`: when that's below
+/// the air's dew point it condenses water out, leaving the air close to
+/// saturated. Returns the leaving humidity ratio.
+pub fn wet_coil(w_in: f64, t_out: f64) -> f64 {
+    w_in.min(crate::world::saturated(t_out + 1.0))
+}
+
+/// A DX coil taking `q_btuh` out of `cfm` of air at `t_in` / `w_in`. In
+/// muggy air part of that goes to wringing water out (up to about a third),
+/// so the air comes off less cold than a dry coil would leave it. Returns the
+/// leaving temperature and humidity ratio.
+pub fn dx_coil(t_in: f64, w_in: f64, cfm: f64, q_btuh: f64) -> (f64, f64) {
+    if q_btuh <= 0.0 || cfm < 1.0 {
+        return (t_in, w_in);
+    }
+    let dry = t_in - q_btuh / (1.08 * cfm);
+    let latent = (LATENT_PER_CFM * cfm * (w_in - wet_coil(w_in, dry))).min(0.35 * q_btuh);
+    (
+        t_in - (q_btuh - latent) / (1.08 * cfm),
+        w_in - latent / (LATENT_PER_CFM * cfm),
+    )
+}
+
 /// A binary status or alarm input.
 pub fn status(db: &mut PointDb, r: PointRef, on: bool) {
     db.set_bool(r, on);
@@ -150,7 +176,11 @@ pub fn program_multi(db: &mut PointDb, r: PointRef, state: u32) {
     db.set_program(r, PointValue::Multi(state));
 }
 
-/// Adds one device and its objects to the database.
+/// The notification class every controller's alarms go to.
+pub const ALARM_CLASS: u32 = 1;
+
+/// Adds one device and its objects to the database. Every device gets a
+/// notification class, `ALARMS`, that its alarm points report through.
 pub struct DevBuilder<'a> {
     db: &'a mut PointDb,
     dev: usize,
@@ -167,6 +197,9 @@ impl<'a> DevBuilder<'a> {
         mac: Option<u8>,
         location: &str,
     ) -> Self {
+        let mut alarms = BacObject::notification_class(ALARM_CLASS, "ALARMS");
+        alarms.description =
+            "Where this controller's alarms go: broadcast on the local network unless a BAS edits the recipient list".into();
         db.devices.push(BacDevice {
             instance,
             name: name.into(),
@@ -175,7 +208,7 @@ impl<'a> DevBuilder<'a> {
             model_name: model.into(),
             mac,
             online: true,
-            objects: Vec::new(),
+            objects: vec![alarms],
             database_revision: 1,
         });
         let dev = db.devices.len() - 1;
@@ -188,6 +221,16 @@ impl<'a> DevBuilder<'a> {
 
     pub fn device(&self) -> usize {
         self.dev
+    }
+
+    /// Adds a ready-made object (a schedule, say).
+    pub fn object(&mut self, obj: BacObject) -> PointRef {
+        let objects = &mut self.db.devices[self.dev].objects;
+        objects.push(obj);
+        PointRef {
+            device: self.dev as u16,
+            object: objects.len() as u16 - 1,
+        }
     }
 
     fn add(
@@ -337,8 +380,17 @@ impl<'a> DevBuilder<'a> {
             .0
     }
 
+    /// An alarm input that reports through BACnet intrinsic alarming.
     pub fn alarm(&mut self, name: &str, description: &str) -> PointRef {
-        self.bi(name, description, ["Normal", "Alarm"])
+        let (r, o) = self.binary(
+            ObjectType::BinaryInput,
+            name,
+            description,
+            ["Normal", "Alarm"],
+            false,
+        );
+        o.enable_change_of_state(true, ALARM_CLASS, 0);
+        r
     }
 
     pub fn bo(&mut self, name: &str, description: &str, states: [&str; 2]) -> PointRef {

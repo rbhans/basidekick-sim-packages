@@ -65,6 +65,37 @@ impl Weather {
         let g = (self.rh.clamp(1.0, 100.0) / 100.0).ln() + a * t / (b + t);
         (b * g / (a - g)) * 1.8 + 32.0
     }
+
+    /// Outdoor humidity ratio, lb of water per lb of dry air.
+    pub fn humidity_ratio(&self) -> f64 {
+        humidity_ratio(self.oat, self.rh)
+    }
+}
+
+/// Sea-level atmospheric pressure, hPa.
+const ATM_HPA: f64 = 1013.25;
+
+/// Saturation vapor pressure over water, hPa (Magnus).
+fn saturation_hpa(t_f: f64) -> f64 {
+    let t = (t_f - 32.0) / 1.8;
+    6.112 * (17.62 * t / (243.12 + t)).exp()
+}
+
+/// Humidity ratio of air at `t_f` and `rh` %, lb of water per lb of dry air.
+pub fn humidity_ratio(t_f: f64, rh: f64) -> f64 {
+    let pw = saturation_hpa(t_f) * rh.clamp(0.0, 100.0) / 100.0;
+    0.622 * pw / (ATM_HPA - pw)
+}
+
+/// The most water air at `t_f` can hold.
+pub fn saturated(t_f: f64) -> f64 {
+    humidity_ratio(t_f, 100.0)
+}
+
+/// Relative humidity, %, of air at `t_f` holding `w`.
+pub fn relative_humidity(t_f: f64, w: f64) -> f64 {
+    let pw = w * ATM_HPA / (0.622 + w);
+    (pw / saturation_hpa(t_f) * 100.0).clamp(0.0, 100.0)
 }
 
 /// Hours after midnight, as a fraction.

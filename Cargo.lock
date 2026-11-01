@@ -556,6 +556,7 @@ name = "basidekick-sim"
 version = "0.1.0"
 dependencies = [
  "bask-bacnet",
+ "bask-points",
  "bask-runner",
  "bask-sim",
  "gpui-kit",
@@ -585,6 +586,7 @@ dependencies = [
 name = "bask-points"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "parking_lot",
 ]
 

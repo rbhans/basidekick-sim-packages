@@ -13,7 +13,7 @@ pub fn usage() -> String {
 BASidekick Building Sim (terminal)
 
   basidekick-sim-cli [options]   run one building on BACnet/IP in this terminal
-  basidekick-sim-cli --list      list the building packages and their scenarios
+  basidekick-sim-cli --list      list the building packages, their scenarios and lessons
 
 Options:
   --package <id or file.toml>    building to run (default small-office)
@@ -24,6 +24,7 @@ Options:
   --scenario <id>                start a scenario right away (repeatable);
                                  `mystery` breaks something at random without saying what
   --show-answers                 print what each mystery fault is (for the instructor)
+  --lesson <id>                  set the building up for a lesson and print its steps
 
 Interfaces here: {}
 
@@ -67,6 +68,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             scenarios.extend(p.scenarios.iter().cloned());
             for s in scenarios {
                 println!("    {:24} {}", s.id, s.name);
+            }
+            for l in &p.lessons {
+                println!("    lesson {:17} {} ({})", l.id, l.title, l.level);
             }
         }
         return Ok(());
@@ -117,6 +121,18 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let rt = Runtime::start(package, net.clone())?;
     {
         let mut sim = rt.sim.lock();
+        if let Some(id) = value(args, "--lesson") {
+            sim.start_lesson(id)?;
+            let l = sim.package.lessons.iter().find(|l| l.id == id).unwrap();
+            println!("{} ({})\n{}\n", l.title, l.level, l.goal);
+            for (i, step) in l.steps.iter().enumerate() {
+                println!("{}. {}", i + 1, step.replace('`', ""));
+            }
+            if args.iter().any(|a| a == "--show-answers") {
+                println!("\nWhat you should see: {}", l.expect.replace('`', ""));
+            }
+            println!();
+        }
         if let Some(s) = value(args, "--speed") {
             sim.speed = s.parse().map_err(|_| format!("bad --speed {s}"))?;
         }

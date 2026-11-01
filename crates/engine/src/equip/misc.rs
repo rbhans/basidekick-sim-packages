@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::control::{Delay, Stager};
-use crate::package::{FanDef, Heating, UnitHeaterDef};
+use crate::package::{FanDef, Heating, Hours, ScheduleDef, UnitHeaterDef};
 use crate::zone::Zone;
-use chrono::Datelike;
+use chrono::{Datelike, NaiveTime};
 
 pub struct Site {
     pub dev: usize,
@@ -17,13 +17,41 @@ pub struct Site {
     occ: PointRef,
     people: PointRef,
     fire: PointRef,
+    /// The building's occupancy schedule, a BACnet schedule object a BAS
+    /// can read and edit.
+    pub schedule: PointRef,
     pub occupied: bool,
 }
 
 impl Site {
-    pub fn new(b: &mut DevBuilder) -> Self {
+    pub fn new(b: &mut DevBuilder, hours: &ScheduleDef) -> Self {
+        let day = |h: Option<Hours>| -> Vec<(NaiveTime, bool)> {
+            let at = |h: f64| {
+                NaiveTime::from_num_seconds_from_midnight_opt(
+                    (h * 3600.0).round() as u32 % 86_400,
+                    0,
+                )
+                .unwrap_or_default()
+            };
+            h.map(|h| vec![(at(h.open), true), (at(h.close), false)])
+                .unwrap_or_default()
+        };
+        let weekday = day(hours.weekday);
+        let weekly = [
+            weekday.clone(),
+            weekday.clone(),
+            weekday.clone(),
+            weekday.clone(),
+            weekday,
+            day(hours.saturday),
+            day(hours.sunday),
+        ];
+        let mut schedule = bask_points::BacObject::schedule(1, "OCC-SCHEDULE", weekly);
+        schedule.description =
+            "Occupancy schedule: the HVAC is occupied while it's On (optimal start brings it on early)".into();
         Site {
             dev: b.device(),
+            schedule: b.object(schedule),
             oa_t: b.ai(
                 "OA-T",
                 "Outside air temperature (weather station)",

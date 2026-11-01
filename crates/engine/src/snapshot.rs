@@ -18,7 +18,11 @@ pub struct Snapshot {
     pub season: Season,
     pub weather: Weather,
     pub occupied: bool,
+    /// When people are due in and out today.
     pub hours: Option<(f64, f64)>,
+    /// When the BACnet occupancy schedule is on today. It starts out the
+    /// same as `hours`; a BAS can edit it.
+    pub schedule: Option<(f64, f64)>,
     pub people: f64,
     pub kw: f64,
     pub kwh: f64,
@@ -33,6 +37,8 @@ pub struct ZoneSnap {
     pub name: String,
     pub temp: f64,
     pub co2: f64,
+    /// Relative humidity, %.
+    pub rh: f64,
     pub people: f64,
     pub setpoints: Option<(f64, f64)>,
     pub supply_cfm: f64,
@@ -89,6 +95,24 @@ pub struct PointSnap {
     pub out_of_service: bool,
     pub fault: bool,
     pub alarm: bool,
+    /// How the app may change it, if at all.
+    pub write: Write,
+    /// Binary and multi-state: what each value means, in order.
+    pub states: Vec<String>,
+    /// Analog: the present value as a number, for editing.
+    pub number: Option<f64>,
+}
+
+/// How a point can be changed from the app, the way an operator would.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Write {
+    ReadOnly,
+    /// Commandable: written at priority 8, released to the program.
+    Command,
+    /// A writable setting: takes the value, no priority.
+    Setting,
+    /// A sensor: taken out of service at a value, put back in service.
+    Sensor,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +159,7 @@ impl Simulation {
                 points: d
                     .objects
                     .iter()
+                    .filter(|o| o.object_type.has_present_value())
                     .map(|o| PointSnap {
                         name: o.name.clone(),
                         kind: o.object_type.abbrev(),
@@ -145,6 +170,17 @@ impl Simulation {
                         out_of_service: o.out_of_service,
                         fault: o.fault(),
                         alarm: o.in_alarm,
+                        write: if o.commandable {
+                            Write::Command
+                        } else if o.object_type.is_input() {
+                            Write::Sensor
+                        } else if o.writable {
+                            Write::Setting
+                        } else {
+                            Write::ReadOnly
+                        },
+                        states: o.states.clone(),
+                        number: o.object_type.is_analog().then(|| o.present_value.as_f64()),
                     })
                     .collect(),
             })
@@ -202,6 +238,7 @@ impl Simulation {
             weather: self.weather,
             occupied: self.occupied,
             hours: self.schedule_hours(),
+            schedule: self.schedule_today(),
             people: self.people,
             kw: self.energy.total_kw(),
             kwh: self.kwh(),
@@ -212,6 +249,7 @@ impl Simulation {
                     name: z.name.clone(),
                     temp: z.temp,
                     co2: z.co2,
+                    rh: z.rh(),
                     people: z.people,
                     setpoints: z.setpoints,
                     supply_cfm: z.supply_cfm,

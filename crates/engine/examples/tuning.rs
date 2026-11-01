@@ -158,8 +158,22 @@ fn main() {
     for b in &bumps {
         for hot in [false, true] {
             let mut sim = Simulation::new(pkg.clone(), start).unwrap();
-            sim.set_season(Season::Summer);
+            // a box steps cleanest in winter, with its cooling loop at rest
+            let vav = b.device.starts_with("VAV");
+            sim.set_season(if vav { Season::Winter } else { Season::Summer });
             sim.speed = 60.0;
+            if vav {
+                // hold static up, so the box can get the air it's asked for,
+                // and its minimum still, so CO2 doesn't move it
+                let mut db = sim.db.lock();
+                for (dev, point) in [("AHU-1", "DSP-RESET"), (b.device, "DCV")] {
+                    let d = db.devices.iter_mut().find(|d| d.name == dev).unwrap();
+                    let o = d.find_by_name(point).unwrap();
+                    d.objects[o]
+                        .write_present_value(Some(PointValue::Binary(false)), Some(8))
+                        .unwrap();
+                }
+            }
             for _ in 0..120 {
                 sim.advance(1.0);
             }

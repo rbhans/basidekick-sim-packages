@@ -7,6 +7,8 @@
 //! each holds. Opening and closing tags bracket constructed values: a
 //! property value of any type, a list of property references.
 
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+
 /// Application tag numbers.
 const NULL: u8 = 0;
 const BOOLEAN: u8 = 1;
@@ -211,17 +213,20 @@ pub fn app_char_string(buf: &mut Vec<u8>, s: &str) {
 }
 
 pub fn app_bit_string(buf: &mut Vec<u8>, bits: &[bool]) {
-    let octets = bits.len().div_ceil(8);
-    tag(buf, BIT_STRING, false, octets + 1);
-    buf.push(((8 - bits.len() % 8) % 8) as u8);
-    for chunk in bits.chunks(8) {
-        buf.push(
-            chunk
-                .iter()
-                .enumerate()
-                .fold(0u8, |acc, (i, &b)| acc | (b as u8) << (7 - i)),
-        );
-    }
+    primitive(buf, BIT_STRING, false, &bit_string(bits));
+}
+
+/// A bit string's content: the unused-bit count, then the bits, first bit
+/// in the high bit.
+fn bit_string(bits: &[bool]) -> Vec<u8> {
+    let mut c = vec![((8 - bits.len() % 8) % 8) as u8];
+    c.extend(bits.chunks(8).map(|chunk| {
+        chunk
+            .iter()
+            .enumerate()
+            .fold(0u8, |acc, (i, &b)| acc | (b as u8) << (7 - i))
+    }));
+    c
 }
 
 pub fn app_date(buf: &mut Vec<u8>, d: [u8; 4]) {
@@ -247,6 +252,93 @@ pub fn ctx_enumerated(buf: &mut Vec<u8>, number: u8, v: u32) {
 
 pub fn ctx_object_id(buf: &mut Vec<u8>, number: u8, id: ObjectId) {
     primitive(buf, number, true, &id.to_u32().to_be_bytes());
+}
+
+pub fn app_octet_string(buf: &mut Vec<u8>, v: &[u8]) {
+    primitive(buf, OCTET_STRING, false, v);
+}
+
+/// A context-tagged primitive whose content is already encoded: a Date, an
+/// OCTET STRING.
+pub fn ctx_octets(buf: &mut Vec<u8>, number: u8, content: &[u8]) {
+    primitive(buf, number, true, content);
+}
+
+/// A context-tagged BOOLEAN carries its value in one content octet.
+pub fn ctx_bool(buf: &mut Vec<u8>, number: u8, v: bool) {
+    primitive(buf, number, true, &[v as u8]);
+}
+
+pub fn ctx_real(buf: &mut Vec<u8>, number: u8, v: f32) {
+    primitive(buf, number, true, &v.to_be_bytes());
+}
+
+pub fn ctx_bit_string(buf: &mut Vec<u8>, number: u8, bits: &[bool]) {
+    primitive(buf, number, true, &bit_string(bits));
+}
+
+pub fn ctx_char_string(buf: &mut Vec<u8>, number: u8, s: &str) {
+    tag(buf, number, true, s.len() + 1);
+    buf.push(0);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Dates and times
+//
+// BACnet Date is year-1900, month, day, weekday (1 = Monday); Time is hour,
+// minute, second, hundredths. 255 in any octet means "any".
+
+pub const ANY_DATE: [u8; 4] = [255; 4];
+pub const ANY_TIME: [u8; 4] = [255; 4];
+
+pub fn date_octets(d: NaiveDate) -> [u8; 4] {
+    [
+        (d.year() - 1900).clamp(0, 254) as u8,
+        d.month() as u8,
+        d.day() as u8,
+        d.weekday().number_from_monday() as u8,
+    ]
+}
+
+pub fn time_octets(t: NaiveTime) -> [u8; 4] {
+    [
+        t.hour() as u8,
+        t.minute() as u8,
+        t.second().min(59) as u8,
+        (t.nanosecond() / 10_000_000).min(99) as u8,
+    ]
+}
+
+/// A fully specified date; the weekday octet isn't checked.
+pub fn date_of(d: [u8; 4]) -> Option<NaiveDate> {
+    if d[0] == 255 {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(1900 + d[0] as i32, d[1] as u32, d[2] as u32)
+}
+
+/// A time of day; unspecified seconds or hundredths count as zero, an
+/// unspecified hour or minute makes it no time at all.
+pub fn time_of(t: [u8; 4]) -> Option<NaiveTime> {
+    let z = |v: u8| if v == 255 { 0 } else { v as u32 };
+    if t[0] == 255 || t[1] == 255 || z(t[3]) > 99 {
+        return None;
+    }
+    NaiveTime::from_hms_milli_opt(t[0] as u32, t[1] as u32, z(t[2]), z(t[3]) * 10)
+}
+
+/// BACnetDateTime: an application Date and Time, unspecified for None.
+pub fn app_date_time(buf: &mut Vec<u8>, t: Option<NaiveDateTime>) {
+    app_date(buf, t.map_or(ANY_DATE, |t| date_octets(t.date())));
+    app_time(buf, t.map_or(ANY_TIME, |t| time_octets(t.time())));
+}
+
+/// BACnetTimeStamp as its dateTime choice.
+pub fn time_stamp(buf: &mut Vec<u8>, t: Option<NaiveDateTime>) {
+    open(buf, 2);
+    app_date_time(buf, t);
+    close(buf, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +417,10 @@ impl<'a> Reader<'a> {
 
     pub fn peek_close(&self, number: u8) -> bool {
         self.peek_tag() == Some(Tag::Close(number))
+    }
+
+    pub fn peek_open(&self, number: u8) -> bool {
+        self.peek_tag() == Some(Tag::Open(number))
     }
 
     pub fn expect_open(&mut self, number: u8) -> DResult<()> {
@@ -441,40 +537,43 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// A property value bracketed by opening/closing tag `number`: the
-    /// application values inside, or None when it holds constructed data
-    /// (context tags, nested brackets) that no writable property here takes.
-    pub fn property_value(&mut self, number: u8) -> DResult<Option<Vec<Value>>> {
+    /// The encoded content between opening and closing tag `number`, nested
+    /// brackets and all.
+    pub fn bracketed(&mut self, number: u8) -> DResult<&'a [u8]> {
         self.expect_open(number)?;
-        let mut values = Vec::new();
-        let mut constructed = false;
+        let start = self.pos;
         let mut depth = 0u32;
         loop {
-            match self.peek_tag().ok_or(DecodeError::Truncated)? {
-                Tag::Close(n) if depth == 0 && n == number => {
-                    self.read_tag()?;
-                    break;
+            let end = self.pos;
+            match self.read_tag()? {
+                Tag::Close(n) if depth == 0 => {
+                    return if n == number {
+                        Ok(&self.buf[start..end])
+                    } else {
+                        Err(DecodeError::InvalidTag)
+                    };
                 }
-                Tag::App { .. } if depth == 0 => values.push(self.read_app()?),
-                _ => {
-                    constructed = true;
-                    match self.read_tag()? {
-                        Tag::Open(_) => depth += 1,
-                        Tag::Close(_) => {
-                            depth = depth.checked_sub(1).ok_or(DecodeError::InvalidTag)?
-                        }
-                        Tag::App {
-                            number: BOOLEAN, ..
-                        } => {}
-                        Tag::App { len, .. } | Tag::Context { len, .. } => {
-                            self.take(len as usize)?;
-                        }
-                    }
+                Tag::Open(_) => depth += 1,
+                Tag::Close(_) => depth -= 1,
+                Tag::App {
+                    number: BOOLEAN, ..
+                } => {}
+                Tag::App { len, .. } | Tag::Context { len, .. } => {
+                    self.take(len as usize)?;
                 }
             }
         }
-        Ok(if constructed { None } else { Some(values) })
     }
+}
+
+/// A run of application-tagged values, or None if anything else is in it.
+pub fn app_values(content: &[u8]) -> Option<Vec<Value>> {
+    let mut r = Reader::new(content);
+    let mut values = Vec::new();
+    while !r.at_end() {
+        values.push(r.read_app().ok()?);
+    }
+    Some(values)
 }
 
 pub fn decode_unsigned(c: &[u8]) -> DResult<u64> {
@@ -705,7 +804,7 @@ mod tests {
         slots.iter().for_each(|v| v.encode(&mut buf));
         close(&mut buf, 3);
         let mut r = Reader::new(&buf);
-        assert_eq!(r.property_value(3).unwrap(), Some(slots));
+        assert_eq!(app_values(r.bracketed(3).unwrap()), Some(slots));
         assert!(r.at_end());
     }
 
@@ -720,7 +819,7 @@ mod tests {
         close(&mut buf, 3);
         app_unsigned(&mut buf, 8);
         let mut r = Reader::new(&buf);
-        assert_eq!(r.property_value(3).unwrap(), None);
+        assert_eq!(app_values(r.bracketed(3).unwrap()), None);
         assert_eq!(r.read_app().unwrap(), Value::Unsigned(8));
     }
 
@@ -758,9 +857,6 @@ mod tests {
         let mut buf = Vec::new();
         open(&mut buf, 3);
         app_real(&mut buf, 1.0);
-        assert_eq!(
-            Reader::new(&buf).property_value(3),
-            Err(DecodeError::Truncated)
-        );
+        assert_eq!(Reader::new(&buf).bracketed(3), Err(DecodeError::Truncated));
     }
 }

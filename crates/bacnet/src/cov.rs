@@ -75,9 +75,11 @@ impl CovTable {
 
         let d = &db.devices[dev];
         let id = properties::unwildcard(d, id);
+        // Points and schedules report changes; the device, trend logs and
+        // notification classes have no present value to watch.
         let object = match properties::resolve(d, id) {
-            Ok(Target::Object(i)) => i,
-            Ok(Target::Device) => return Ok(Err(BacError::OPTIONAL_FUNCTIONALITY_NOT_SUPPORTED)),
+            Ok(Target::Object(i)) if d.objects[i].object_type.has_present_value() => i,
+            Ok(_) => return Ok(Err(BacError::OPTIONAL_FUNCTIONALITY_NOT_SUPPORTED)),
             Err(e) => return Ok(Err(e)),
         };
         let existing = self.subs.iter().position(|s| {
